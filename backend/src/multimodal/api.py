@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -61,6 +62,15 @@ def create_app() -> FastAPI:
     container = ServiceContainer()
 
     app = FastAPI(title="Multimodal PDF Image Retrieval System")
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
     app.mount("/assets", StaticFiles(directory=str(IMAGE_DIR)), name="assets")
 
     @app.get("/health")

@@ -14,8 +14,10 @@ from typing import Any, Sequence
 
 try:
     from google import genai
+    from google.genai import types as genai_types
 except ImportError:  # pragma: no cover - dependency may be installed later
     genai = None  # type: ignore[assignment]
+    genai_types = None  # type: ignore[assignment]
 
 
 EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-2-preview")
@@ -62,6 +64,20 @@ def read_binary_file(path: str | Path) -> EmbeddedFile:
 def _extract_embedding_vector(response: Any) -> list[float]:
     """Extract a flat embedding vector from common google-genai response shapes."""
 
+    if isinstance(response, dict):
+        if "embedding" in response and isinstance(response["embedding"], dict):
+            values = response["embedding"].get("values")
+            if values is not None:
+                return list(values)
+        if "embeddings" in response and response["embeddings"]:
+            first = response["embeddings"][0]
+            if isinstance(first, dict):
+                values = first.get("values")
+                if values is not None:
+                    return list(values)
+        if "values" in response:
+            return list(response["values"])
+
     embedding = getattr(response, "embedding", None)
     if embedding is not None:
         values = getattr(embedding, "values", None)
@@ -78,14 +94,6 @@ def _extract_embedding_vector(response: Any) -> list[float]:
     values = getattr(response, "values", None)
     if values is not None:
         return list(values)
-
-    if isinstance(response, dict):
-        if "embedding" in response and isinstance(response["embedding"], dict):
-            values = response["embedding"].get("values")
-            if values is not None:
-                return list(values)
-        if "values" in response:
-            return list(response["values"])
 
     raise ValueError("Could not extract embedding vector from response")
 
@@ -104,21 +112,14 @@ def embed_file(
 
     embedded_file = read_binary_file(path)
     part = None
-    types = getattr(client, "types", None)
-    if types is not None:
-        part_factory = getattr(types, "Part", None)
-        if part_factory is not None and hasattr(part_factory, "from_bytes"):
-            part = part_factory.from_bytes(
+    if genai_types is not None and hasattr(genai_types.Part, "from_bytes"):
+        part = genai_types.Part.from_bytes(
                 data=embedded_file.data,
                 mime_type=embedded_file.mime_type,
-            )
+        )
 
     contents: Any = part if part is not None else embedded_file.data
-    response = client.models.embed_content(
-        model=model,
-        contents=contents,
-        config={"mime_type": embedded_file.mime_type},
-    )
+    response = client.models.embed_content(model=model, contents=contents)
     return _extract_embedding_vector(response)
 
 
@@ -130,11 +131,7 @@ def embed_text(
 ) -> list[float]:
     """Embed plain text with the same multimodal model."""
 
-    response = client.models.embed_content(
-        model=model,
-        contents=text,
-        config={"mime_type": "text/plain"},
-    )
+    response = client.models.embed_content(model=model, contents=text)
     return _extract_embedding_vector(response)
 
 
