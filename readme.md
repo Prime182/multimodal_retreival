@@ -5,7 +5,7 @@ This repo now contains a working split between a Python backend and a React fron
 - `backend/src/multimodal/ingestion.py`
   Parses PDFs by extracting page text and embedded images separately, which avoids the Gemini six-page PDF limit.
 - `backend/src/multimodal/embeddings.py`
-  Embeds text, images, and PDFs with `embedding-001` through a shared helper layer.
+  Embeds text, images, and PDFs with `gemini-embedding-2-preview` through a shared helper layer.
 - `backend/src/multimodal/storage.py`
   Persists embeddings plus UI-facing metadata in a local Chroma collection named `publisher_articles`.
 - `backend/src/multimodal/service.py`
@@ -54,6 +54,12 @@ Environment:
 ```bash
 cp .env.example .env
 cp frontend/.env.example frontend/.env
+```
+
+The backend defaults to:
+
+```bash
+GEMINI_EMBEDDING_MODEL=gemini-embedding-2-preview
 ```
 
 System tools required for PDF ingestion:

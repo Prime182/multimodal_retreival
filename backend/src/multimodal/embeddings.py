@@ -1,12 +1,13 @@
 """Helpers for multimodal Gemini embeddings.
 
-The `embedding-001` model maps text, images, and PDFs into the same vector
-space, which is what makes cross-media retrieval possible.
+The `gemini-embedding-2-preview` model maps text, images, and PDFs into the
+same vector space, which is what makes cross-media retrieval possible.
 """
 
 from __future__ import annotations
 
 import mimetypes
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -17,7 +18,7 @@ except ImportError:  # pragma: no cover - dependency may be installed later
     genai = None  # type: ignore[assignment]
 
 
-EMBEDDING_MODEL = "embedding-001"
+EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-2-preview")
 
 
 @dataclass(frozen=True)
