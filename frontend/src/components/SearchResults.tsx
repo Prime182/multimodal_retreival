@@ -37,7 +37,13 @@ const getImageSource = (metadata?: SearchResultMetadata | null) => {
   if (!metadata) {
     return "";
   }
-  return metadata.imageUrl ?? metadata.file_path ?? "";
+  const src = metadata.imageUrl ?? metadata.file_path ?? "";
+  if (src.startsWith("/") && !src.startsWith("//")) {
+    const env = (import.meta as any).env;
+    const API_BASE_URL = env?.VITE_API_BASE_URL ?? "http://localhost:8000";
+    return `${API_BASE_URL}${src}`;
+  }
+  return src;
 };
 
 const compareResults = (mode: "distance" | "score", a: SearchResultItem, b: SearchResultItem) => {
@@ -85,7 +91,7 @@ export function SearchResults({
   emptyState = "No matching images were found.",
   onResultClick,
 }: SearchResultsProps) {
-  const mode = resolveMode(results, rankingMode);
+  const mode = resolveMode(results, rankingMode) || "distance";
   const sortedResults = [...results].sort((a, b) => compareResults(mode, a, b));
 
   return (
@@ -113,11 +119,12 @@ export function SearchResults({
             const caption = metadata.caption ?? metadata.title ?? result.id;
             const metricValue = mode === "distance" ? result.distance : result.score;
             const metricLabel = mode === "distance" ? "distance" : "score";
+            const sourcePath = metadata.source_path as string | undefined;
             const sourceLabel =
               typeof metadata.source === "string"
                 ? metadata.source
-                : typeof metadata.source_path === "string"
-                  ? metadata.source_path.split("/").at(-1)
+                : typeof sourcePath === "string"
+                  ? sourcePath.split("/").pop()
                   : null;
 
             return (
