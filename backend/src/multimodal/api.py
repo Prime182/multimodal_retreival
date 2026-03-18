@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,6 +26,8 @@ DATA_DIR = BASE_DIR / "backend" / "data"
 IMAGE_DIR = DATA_DIR / "images"
 CHROMA_DIR = DATA_DIR / "chroma"
 
+ContentTypeValue = Literal["text", "equation", "table", "image"]
+
 
 class IndexRequest(BaseModel):
     pdf_path: str = Field(..., description="Absolute or repo-relative path to the PDF file.")
@@ -33,6 +36,10 @@ class IndexRequest(BaseModel):
 class SearchRequest(BaseModel):
     query: str
     limit: int = Field(default=5, ge=1, le=25)
+    content_types: list[ContentTypeValue] | None = Field(
+        default=None,
+        description="Optional content-type filter for text, equation, table, and image results.",
+    )
 
 
 class ServiceContainer:
@@ -61,7 +68,7 @@ def create_app() -> FastAPI:
     CHROMA_DIR.mkdir(parents=True, exist_ok=True)
     container = ServiceContainer()
 
-    app = FastAPI(title="Multimodal PDF Image Retrieval System")
+    app = FastAPI(title="Multimodal PDF Retrieval System")
 
     app.add_middleware(
         CORSMiddleware,
@@ -89,17 +96,26 @@ def create_app() -> FastAPI:
         document = service.index_pdf(pdf_path, IMAGE_DIR)
         return {
             "document_id": document.document_id,
+            "journal_id": document.journal_id,
+            "article_id": document.article_id,
             "source_path": document.source_path,
             "text_chunks": len(document.text_chunks),
+            "equation_chunks": len(document.equation_chunks),
+            "table_chunks": len(document.table_chunks),
             "images": len(document.images),
         }
 
     @app.post("/search")
     def search(request: SearchRequest) -> dict[str, object]:
         service = container.get_service()
-        results = service.search_images(request.query, limit=request.limit)
+        results = service.search(
+            request.query,
+            limit=request.limit,
+            content_types=request.content_types,
+        )
         return {
             "query": request.query,
+            "content_types": request.content_types,
             "results": [
                 {
                     "id": result.item_id,

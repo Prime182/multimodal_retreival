@@ -4,14 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 try:
     import chromadb
-except ImportError:  # pragma: no cover - dependency may be installed later
+except ImportError:  # pragma: no cover - dependency may be installed later.
     chromadb = None  # type: ignore[assignment]
 
-from .types import ExtractedImage, SearchResult, TextChunk
+from .types import EquationChunk, ExtractedImage, SearchResult, TableChunk, TextChunk
 
 
 DEFAULT_COLLECTION_NAME = "publisher_articles"
@@ -19,8 +19,6 @@ DEFAULT_COLLECTION_NAME = "publisher_articles"
 
 @dataclass(frozen=True)
 class PublisherArticleRecord:
-    """Normalized payload stored in ChromaDB."""
-
     id: str
     embedding: list[float]
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -28,8 +26,6 @@ class PublisherArticleRecord:
 
 
 def _clean_metadata(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Keep metadata JSON-serializable and Chroma-friendly."""
-
     if not metadata:
         return {}
 
@@ -47,12 +43,6 @@ def _clean_metadata(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
 
 
 class PublisherArticleStore:
-    """Persistence wrapper around a Chroma collection.
-
-    Embeddings are only numeric vectors; the UI depends on metadata like
-    `imageUrl`, `file_path`, and `caption` to render the actual asset later.
-    """
-
     def __init__(
         self,
         *,
@@ -69,40 +59,7 @@ class PublisherArticleStore:
         self.client = client or chromadb.PersistentClient(path=str(self.persist_directory))
         self.collection = self.client.get_or_create_collection(name=collection_name)
 
-    def add(
-        self,
-        *,
-        id: str,
-        embedding: list[float],
-        metadata: Mapping[str, Any] | None = None,
-        document: str | None = None,
-    ) -> None:
-        """Add a single record to the collection."""
-
-        record = PublisherArticleRecord(
-            id=id,
-            embedding=embedding,
-            metadata=_clean_metadata(metadata),
-            document=document,
-        )
-        self.collection.add(
-            ids=[record.id],
-            embeddings=[record.embedding],
-            **(
-                {"metadatas": [record.metadata]}
-                if record.metadata
-                else {}
-            ),
-            **(
-                {"documents": [record.document]}
-                if record.document is not None
-                else {}
-            ),
-        )
-
     def add_many(self, records: Iterable[PublisherArticleRecord]) -> None:
-        """Add many records in one call."""
-
         ids: list[str] = []
         embeddings: list[list[float]] = []
         metadatas: list[dict[str, Any]] = []
@@ -112,16 +69,17 @@ class PublisherArticleStore:
             ids.append(record.id)
             embeddings.append(record.embedding)
             metadatas.append(_clean_metadata(record.metadata))
-            if record.document is not None:
-                documents.append(record.document)
+            documents.append(record.document or "")
 
-        payload: dict[str, Any] = {"ids": ids, "embeddings": embeddings}
-        if any(metadatas):
-            payload["metadatas"] = metadatas
-        if documents and len(documents) == len(ids):
-            payload["documents"] = documents
+        if not ids:
+            return
 
-        self.collection.add(**payload)
+        self.collection.add(
+            ids=ids,
+            embeddings=embeddings,
+            metadatas=metadatas,
+            documents=documents,
+        )
 
     def add_text_chunks(
         self,
@@ -133,12 +91,43 @@ class PublisherArticleStore:
                 id=chunk.chunk_id,
                 embedding=embedding,
                 metadata=chunk.metadata(),
-                document=chunk.text,
+                document=chunk.embed_text,
             )
             for chunk, embedding in zip(chunks, embeddings, strict=True)
         ]
-        if records:
-            self.add_many(records)
+        self.add_many(records)
+
+    def add_equations(
+        self,
+        equations: Iterable[EquationChunk],
+        embeddings: Iterable[list[float]],
+    ) -> None:
+        records = [
+            PublisherArticleRecord(
+                id=equation.chunk_id,
+                embedding=embedding,
+                metadata=equation.metadata(),
+                document=equation.embed_text,
+            )
+            for equation, embedding in zip(equations, embeddings, strict=True)
+        ]
+        self.add_many(records)
+
+    def add_tables(
+        self,
+        tables: Iterable[TableChunk],
+        embeddings: Iterable[list[float]],
+    ) -> None:
+        records = [
+            PublisherArticleRecord(
+                id=table.chunk_id,
+                embedding=embedding,
+                metadata=table.metadata(),
+                document=table.embed_text,
+            )
+            for table, embedding in zip(tables, embeddings, strict=True)
+        ]
+        self.add_many(records)
 
     def add_images(
         self,
@@ -154,20 +143,25 @@ class PublisherArticleStore:
             )
             for image, embedding in zip(images, embeddings, strict=True)
         ]
-        if records:
-            self.add_many(records)
+        self.add_many(records)
 
-    def search_images(
+    def search(
         self,
         query_embedding: list[float],
         *,
         limit: int = 5,
+        content_types: Sequence[str] | None = None,
     ) -> list[SearchResult]:
+        include = ["metadatas", "distances"]
+        where: dict[str, Any] | None = None
+        if content_types:
+            where = {"kind": {"$in": list(content_types)}}
+
         response = self.collection.query(
             query_embeddings=[query_embedding],
             n_results=limit,
-            where={"kind": "image"},
-            include=["metadatas", "distances"],
+            where=where,
+            include=include,
         )
 
         ids = response.get("ids", [[]])
@@ -182,8 +176,6 @@ class PublisherArticleStore:
         ):
             if not metadata:
                 continue
-            if not metadata.get("imageUrl") and not metadata.get("file_path"):
-                continue
             results.append(
                 SearchResult(
                     item_id=item_id,
@@ -192,6 +184,14 @@ class PublisherArticleStore:
                 )
             )
         return results
+
+    def search_images(
+        self,
+        query_embedding: list[float],
+        *,
+        limit: int = 5,
+    ) -> list[SearchResult]:
+        return self.search(query_embedding, limit=limit, content_types=["image"])
 
     def collection_count(self) -> int:
         return self.collection.count()
@@ -202,8 +202,6 @@ def create_store(
     *,
     collection_name: str = DEFAULT_COLLECTION_NAME,
 ) -> PublisherArticleStore:
-    """Factory for the canonical persistent store."""
-
     return PublisherArticleStore(
         persist_directory=persist_directory,
         collection_name=collection_name,

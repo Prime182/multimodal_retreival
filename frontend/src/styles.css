@@ -1,7 +1,8 @@
 :root {
   color: #14213d;
   background:
-    radial-gradient(circle at top left, rgba(252, 163, 17, 0.22), transparent 28%),
+    radial-gradient(circle at top left, rgba(252, 163, 17, 0.2), transparent 26%),
+    radial-gradient(circle at top right, rgba(52, 122, 219, 0.12), transparent 24%),
     linear-gradient(180deg, #f7f4ea 0%, #fffdf7 100%);
   font-family: "Space Grotesk", "Segoe UI", sans-serif;
 }
@@ -41,13 +42,13 @@ input {
 
 .hero h1 {
   margin: 0;
-  max-width: 11ch;
+  max-width: 13ch;
   font-size: clamp(2.6rem, 6vw, 5rem);
   line-height: 0.95;
 }
 
 .lede {
-  max-width: 60ch;
+  max-width: 64ch;
   color: rgba(20, 33, 61, 0.82);
   font-size: 1.05rem;
   line-height: 1.7;
@@ -55,30 +56,140 @@ input {
 
 .search-form {
   display: grid;
+  gap: 14px;
+  margin-bottom: 28px;
+  padding: 18px;
+  border: 1px solid rgba(20, 33, 61, 0.12);
+  border-radius: 24px;
+  background: rgba(255, 255, 255, 0.62);
+  box-shadow: 0 18px 42px rgba(41, 28, 14, 0.08);
+  backdrop-filter: blur(14px);
+}
+
+.search-form__row {
+  display: grid;
   gap: 12px;
   grid-template-columns: minmax(0, 1fr) auto;
-  margin-bottom: 28px;
 }
 
 .search-form input {
-  border: 1px solid rgba(20, 33, 61, 0.18);
+  min-width: 0;
+  border: 1px solid rgba(20, 33, 61, 0.16);
   border-radius: 16px;
   padding: 16px 18px;
-  background: rgba(255, 255, 255, 0.82);
+  background: rgba(255, 255, 255, 0.92);
+  color: #14213d;
+  transition:
+    border-color 180ms ease,
+    box-shadow 180ms ease,
+    transform 180ms ease;
+}
+
+.search-form input::placeholder {
+  color: rgba(20, 33, 61, 0.45);
+}
+
+.search-form input:focus {
+  border-color: rgba(52, 122, 219, 0.5);
+  box-shadow: 0 0 0 4px rgba(52, 122, 219, 0.12);
+  outline: none;
 }
 
 .search-form button {
   border: none;
   border-radius: 16px;
   padding: 16px 22px;
-  background: #14213d;
+  background: linear-gradient(135deg, #14213d 0%, #223563 100%);
   color: #fff;
   cursor: pointer;
+  transition:
+    transform 180ms ease,
+    opacity 180ms ease,
+    box-shadow 180ms ease;
+}
+
+.search-form button:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 10px 24px rgba(20, 33, 61, 0.2);
 }
 
 .search-form button:disabled {
   opacity: 0.65;
   cursor: wait;
+}
+
+.type-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.type-chip {
+  border: 1px solid transparent;
+  border-radius: 999px;
+  padding: 10px 14px;
+  background: rgba(255, 255, 255, 0.86);
+  color: #4a4f63;
+  cursor: pointer;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  transition:
+    transform 180ms ease,
+    box-shadow 180ms ease,
+    border-color 180ms ease,
+    background-color 180ms ease,
+    color 180ms ease;
+}
+
+.type-chip:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 18px rgba(20, 33, 61, 0.08);
+}
+
+.type-chip:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 4px rgba(52, 122, 219, 0.16);
+}
+
+.type-chip.is-active {
+  color: #14213d;
+  background: rgba(255, 255, 255, 0.98);
+}
+
+.type-chip--text.is-active {
+  border-color: rgba(39, 89, 215, 0.28);
+  background: rgba(39, 89, 215, 0.12);
+}
+
+.type-chip--equation.is-active {
+  border-color: rgba(138, 68, 216, 0.28);
+  background: rgba(138, 68, 216, 0.12);
+}
+
+.type-chip--table.is-active {
+  border-color: rgba(13, 143, 151, 0.28);
+  background: rgba(13, 143, 151, 0.12);
+}
+
+.type-chip--image.is-active {
+  border-color: rgba(207, 107, 34, 0.28);
+  background: rgba(207, 107, 34, 0.12);
+}
+
+.type-chip--text:not(.is-active) {
+  color: #2c56c6;
+}
+
+.type-chip--equation:not(.is-active) {
+  color: #7b3cc3;
+}
+
+.type-chip--table:not(.is-active) {
+  color: #0a767d;
+}
+
+.type-chip--image:not(.is-active) {
+  color: #ad5b1e;
 }
 
 .error-banner {
@@ -104,6 +215,14 @@ input {
   }
 
   .search-form {
+    padding: 14px;
+  }
+
+  .search-form__row {
     grid-template-columns: 1fr;
+  }
+
+  .search-form button {
+    width: 100%;
   }
 }
