@@ -99,9 +99,9 @@ function compareResults(
 
 function resolveMode(
   results: SearchResult[],
-  rankingMode: SearchResultsProps["rankingMode"]
-) {
-  if (rankingMode !== "auto") {
+  rankingMode: SearchResultsProps["rankingMode"] = "auto"
+): "distance" | "score" {
+  if (rankingMode === "distance" || rankingMode === "score") {
     return rankingMode;
   }
 
@@ -342,7 +342,7 @@ export function SearchResults({
   emptyState = "No matching results were found.",
   onResultClick
 }: SearchResultsProps) {
-  const mode = resolveMode(results, rankingMode) || "distance";
+  const mode = resolveMode(results, rankingMode);
   const sortedResults = [...results].sort((a, b) => compareResults(mode, a, b));
   const kindCounts = sortedResults.reduce<Record<ContentType, number>>(
     (counts, result) => {

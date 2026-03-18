@@ -7,20 +7,21 @@ import re
 
 
 ContentType = Literal["text", "equation", "table", "image"]
-_PDF_STEM_RE = re.compile(r"^(?P<jid>[A-Za-z]{2})(?:_(?P<aid1>[A-Za-z0-9]+)|(?P<aid2>[A-Za-z0-9]+))$")
+_PDF_STEM_RE = re.compile(r"^(?P<jid>[A-Za-z]{2,6})_(?P<aid>[A-Za-z0-9]+)$")
+_PDF_STEM_NOUNDERSCORE_RE = re.compile(r"^(?P<jid>[A-Za-z]{2,6})(?P<aid>[0-9]+)$")
 
 
 def parse_pdf_filename(path: str | Path) -> tuple[str, str]:
     stem = Path(path).stem
     match = _PDF_STEM_RE.fullmatch(stem)
-    if not match:
-        raise ValueError(
-            f"PDF filename '{stem}' must match '<JJ><ARTICLE>' or '<JJ>_<ARTICLE>' with a two-letter journal prefix."
-        )
-    article_id = match.group("aid1") or match.group("aid2")
-    if not article_id:
-        raise ValueError(f"Could not derive article_id from '{stem}'.")
-    return match.group("jid").upper(), article_id
+    if match:
+        return match.group("jid").upper(), match.group("aid")
+
+    match = _PDF_STEM_NOUNDERSCORE_RE.fullmatch(stem)
+    if match:
+        return match.group("jid").upper(), match.group("aid")
+
+    return "UNK", stem
 
 
 def build_document_id(path: str | Path) -> str:

@@ -42,6 +42,21 @@ def _clean_metadata(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
     return cleaned
 
 
+def _strict_zip(
+    left: Iterable[Any],
+    right: Iterable[Any],
+    *,
+    label: str = "items",
+) -> zip[tuple[Any, Any]]:
+    left_list = list(left)
+    right_list = list(right)
+    if len(left_list) != len(right_list):
+        raise ValueError(
+            f"Mismatch: {len(left_list)} {label} but {len(right_list)} embeddings."
+        )
+    return zip(left_list, right_list)
+
+
 class PublisherArticleStore:
     def __init__(
         self,
@@ -93,7 +108,7 @@ class PublisherArticleStore:
                 metadata=chunk.metadata(),
                 document=chunk.embed_text,
             )
-            for chunk, embedding in zip(chunks, embeddings, strict=True)
+            for chunk, embedding in _strict_zip(chunks, embeddings, label="text chunks")
         ]
         self.add_many(records)
 
@@ -109,7 +124,11 @@ class PublisherArticleStore:
                 metadata=equation.metadata(),
                 document=equation.embed_text,
             )
-            for equation, embedding in zip(equations, embeddings, strict=True)
+            for equation, embedding in _strict_zip(
+                equations,
+                embeddings,
+                label="equations",
+            )
         ]
         self.add_many(records)
 
@@ -125,7 +144,7 @@ class PublisherArticleStore:
                 metadata=table.metadata(),
                 document=table.embed_text,
             )
-            for table, embedding in zip(tables, embeddings, strict=True)
+            for table, embedding in _strict_zip(tables, embeddings, label="tables")
         ]
         self.add_many(records)
 
@@ -141,7 +160,7 @@ class PublisherArticleStore:
                 metadata=image.metadata(),
                 document=image.caption,
             )
-            for image, embedding in zip(images, embeddings, strict=True)
+            for image, embedding in _strict_zip(images, embeddings, label="images")
         ]
         self.add_many(records)
 
@@ -152,17 +171,26 @@ class PublisherArticleStore:
         limit: int = 5,
         content_types: Sequence[str] | None = None,
     ) -> list[SearchResult]:
+        count = self.collection.count()
+        if count == 0:
+            return []
+
         include = ["metadatas", "distances"]
+        effective_limit = min(limit, count)
         where: dict[str, Any] | None = None
         if content_types:
             where = {"kind": {"$in": list(content_types)}}
 
-        response = self.collection.query(
-            query_embeddings=[query_embedding],
-            n_results=limit,
-            where=where,
-            include=include,
-        )
+        try:
+            response = self.collection.query(
+                query_embeddings=[query_embedding],
+                n_results=effective_limit,
+                where=where,
+                include=include,
+            )
+        except Exception as exc:
+            print(f"[WARN] ChromaDB query failed: {exc}")
+            return []
 
         ids = response.get("ids", [[]])
         metadatas = response.get("metadatas", [[]])

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import Literal
@@ -20,6 +21,7 @@ from .service import MultimodalRetrievalService
 from .storage import PublisherArticleStore
 
 load_dotenv()
+logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parents[3]
 DATA_DIR = BASE_DIR / "backend" / "data"
@@ -93,7 +95,20 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="PDF not found.")
 
         service = container.get_service()
-        document = service.index_pdf(pdf_path, IMAGE_DIR)
+        try:
+            document = service.index_pdf(pdf_path, IMAGE_DIR)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            logger.exception("Ingestion failed for %s", pdf_path)
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("Unexpected error indexing %s", pdf_path)
+            raise HTTPException(
+                status_code=500,
+                detail="Indexing failed; check server logs.",
+            ) from exc
+
         return {
             "document_id": document.document_id,
             "journal_id": document.journal_id,
@@ -108,11 +123,18 @@ def create_app() -> FastAPI:
     @app.post("/search")
     def search(request: SearchRequest) -> dict[str, object]:
         service = container.get_service()
-        results = service.search(
-            request.query,
-            limit=request.limit,
-            content_types=request.content_types,
-        )
+        try:
+            results = service.search(
+                request.query,
+                limit=request.limit,
+                content_types=request.content_types,
+            )
+        except Exception as exc:
+            logger.exception("Search failed for query %r", request.query)
+            raise HTTPException(
+                status_code=500,
+                detail="Search failed; check server logs.",
+            ) from exc
         return {
             "query": request.query,
             "content_types": request.content_types,

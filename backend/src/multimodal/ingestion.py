@@ -48,7 +48,7 @@ _KNOWN_SECTION_NAMES = {
     "references",
     "appendix",
 }
-_MATH_SYMBOLS = set("=+-*/^_<>%()[]{}|\\∑∫√≈≠≤≥±∞∂∆∇λμσπθβα")
+_MATH_SYMBOLS = set("=<>±∑∫√≈≠≤≥∞∂∆∇λμσπθβα^")
 _LATEX_MARKERS = (
     "\\frac",
     "\\sum",
@@ -62,6 +62,50 @@ _LATEX_MARKERS = (
     "\\pi",
     "\\sqrt",
 )
+_PROSE_VETO_WORDS = {
+    "the",
+    "and",
+    "that",
+    "this",
+    "with",
+    "from",
+    "have",
+    "which",
+    "their",
+    "were",
+    "been",
+    "than",
+    "these",
+    "those",
+    "however",
+    "therefore",
+    "although",
+    "results",
+    "figure",
+    "table",
+    "study",
+    "patients",
+    "participants",
+    "data",
+    "analysis",
+    "treatment",
+}
+_MATH_CONTEXT_WORDS = {
+    "equation",
+    "formula",
+    "integral",
+    "derivative",
+    "matrix",
+    "vector",
+    "scalar",
+    "coefficient",
+    "eigenvalue",
+    "function",
+    "polynomial",
+    "theorem",
+    "proof",
+    "lemma",
+}
 _IMAGE_NAME_RE = re.compile(r"(\d+)")
 _PDFIMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 
@@ -96,6 +140,7 @@ class PDFIngestionAgent:
 
         pages = _extract_page_text(source_pdf)
         section_map = _build_section_map(pages)
+        table_exclusion = _build_table_text_exclusion(source_pdf)
 
         return IngestedDocument(
             document_id=document_id,
@@ -116,6 +161,7 @@ class PDFIngestionAgent:
                 journal_id=journal_id,
                 article_id=article_id,
                 source_path=str(source_pdf),
+                table_exclusion=table_exclusion,
             ),
             table_chunks=_extract_tables(
                 pdf_path=source_pdf,
@@ -337,6 +383,7 @@ def _extract_equations(
     journal_id: str,
     article_id: str,
     source_path: str,
+    table_exclusion: set[str],
 ) -> list[EquationChunk]:
     chunks: list[EquationChunk] = []
 
@@ -367,6 +414,9 @@ def _extract_equations(
             block_start = 0
 
         for index, line in enumerate(lines):
+            if _normalise_line(line) in table_exclusion:
+                flush(index)
+                continue
             if _is_equation_line(line):
                 if not block:
                     block_start = index
@@ -381,25 +431,45 @@ def _extract_equations(
 
 def _is_equation_line(line: str) -> bool:
     stripped = line.strip()
-    if not stripped:
+    if len(stripped) < 3:
         return False
 
-    non_space_chars = [char for char in stripped if not char.isspace()]
-    if not non_space_chars:
+    tokens = stripped.split()
+    word_count = len(tokens)
+    lower_tokens = {token.lower().strip(".,;:()[]") for token in tokens}
+    prose_hits = lower_tokens & _PROSE_VETO_WORDS
+    if len(prose_hits) > 2:
         return False
-
-    math_hits = sum(char in _MATH_SYMBOLS for char in non_space_chars)
-    math_density = math_hits / len(non_space_chars)
+    if word_count > 12 and prose_hits:
+        return False
 
     if any(marker in stripped for marker in _LATEX_MARKERS):
         return True
-    if math_density >= 0.15 and any(char in stripped for char in "=<>±∑∫√"):
-        return True
-    if re.search(r"\b([A-Za-z]\s*=\s*.+|.+\s*=\s*[A-Za-z0-9(])", stripped):
-        return True
-    if re.search(r"\([^)]+\)\s*[=<>]", stripped):
-        return True
-    return False
+
+    score = 0
+
+    non_space = [char for char in stripped if not char.isspace()]
+    if non_space:
+        math_hits = sum(char in _MATH_SYMBOLS for char in non_space)
+        density = math_hits / len(non_space)
+        if density >= 0.30:
+            score += 1
+
+    numeric_eq = re.search(
+        r"(?<!\w)([A-Za-z]{1,4}|\d[\d.,]*)\s*[=<>]\s*(\d[\d.,]*[A-Za-z]{0,3}|[A-Za-z]{1,4})(?!\w)",
+        stripped,
+    )
+    if numeric_eq:
+        score += 1
+
+    operator_cluster = re.search(r"\d[\d.]*\s*[+\-*/^]\s*\d[\d.]*", stripped)
+    if operator_cluster:
+        score += 1
+
+    if lower_tokens & _MATH_CONTEXT_WORDS:
+        score += 1
+
+    return score >= 2
 
 
 def _extract_equation_context(lines: Sequence[str], start: int, end: int) -> str:
@@ -414,6 +484,28 @@ def _extract_equation_context(lines: Sequence[str], start: int, end: int) -> str
         if cleaned:
             return cleaned
     return text.strip()
+
+
+def _build_table_text_exclusion(pdf_path: Path) -> set[str]:
+    if pdfplumber is None:
+        return set()
+
+    exclusion: set[str] = set()
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        for page in pdf.pages:
+            for table in page.extract_tables() or []:
+                for row in table:
+                    for cell in row:
+                        if not cell:
+                            continue
+                        normalized = re.sub(r"\s+", " ", str(cell)).strip().lower()
+                        if normalized:
+                            exclusion.add(normalized)
+    return exclusion
+
+
+def _normalise_line(line: str) -> str:
+    return re.sub(r"\s+", " ", line).strip().lower()
 
 
 def _extract_tables(

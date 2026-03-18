@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import mimetypes
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -65,6 +66,11 @@ def _extract_embedding_vector(response: Any) -> list[float]:
     """Extract a flat embedding vector from common google-genai response shapes."""
 
     if isinstance(response, dict):
+        content_embedding = response.get("content_embedding")
+        if isinstance(content_embedding, dict):
+            values = content_embedding.get("values")
+            if values is not None:
+                return list(values)
         if "embedding" in response and isinstance(response["embedding"], dict):
             values = response["embedding"].get("values")
             if values is not None:
@@ -77,6 +83,12 @@ def _extract_embedding_vector(response: Any) -> list[float]:
                     return list(values)
         if "values" in response:
             return list(response["values"])
+
+    content_embedding = getattr(response, "content_embedding", None)
+    if content_embedding is not None:
+        values = getattr(content_embedding, "values", None)
+        if values is not None:
+            return list(values)
 
     embedding = getattr(response, "embedding", None)
     if embedding is not None:
@@ -98,6 +110,62 @@ def _extract_embedding_vector(response: Any) -> list[float]:
     raise ValueError("Could not extract embedding vector from response")
 
 
+def _build_part(data: bytes, mime_type: str) -> Any:
+    """Try supported google-genai Part constructors in order of preference."""
+
+    if genai_types is None:
+        raise ImportError("google-genai is required for file embedding.")
+
+    if hasattr(genai_types.Part, "from_bytes"):
+        try:
+            return genai_types.Part.from_bytes(data=data, mime_type=mime_type)
+        except Exception:
+            pass
+
+    if hasattr(genai_types, "Blob"):
+        try:
+            return genai_types.Part(
+                inline_data=genai_types.Blob(data=data, mime_type=mime_type)
+            )
+        except Exception:
+            pass
+
+    import base64
+
+    return {
+        "inline_data": {
+            "mime_type": mime_type,
+            "data": base64.b64encode(data).decode("utf-8"),
+        }
+    }
+
+
+def _with_retry(fn: Any, *, max_attempts: int = 5, base_delay: float = 1.0) -> Any:
+    """Retry transient Gemini errors with exponential backoff."""
+
+    for attempt in range(max_attempts):
+        try:
+            return fn()
+        except Exception as exc:
+            message = str(exc).lower()
+            is_retryable = (
+                "429" in message
+                or "quota" in message
+                or "rate" in message
+                or "timeout" in message
+            )
+            if not is_retryable or attempt == max_attempts - 1:
+                raise
+            delay = base_delay * (2 ** attempt)
+            print(
+                f"[WARN] Gemini rate-limit hit; retrying in {delay:.1f}s "
+                f"(attempt {attempt + 1})"
+            )
+            time.sleep(delay)
+
+    raise RuntimeError("Unreachable")
+
+
 def embed_file(
     client: Any,
     path: str | Path,
@@ -111,14 +179,24 @@ def embed_file(
     """
 
     embedded_file = read_binary_file(path)
-    part = None
-    if genai_types is not None and hasattr(genai_types.Part, "from_bytes"):
-        part = genai_types.Part.from_bytes(
-                data=embedded_file.data,
-                mime_type=embedded_file.mime_type,
-        )
+    part = _build_part(embedded_file.data, embedded_file.mime_type)
 
-    contents: Any = part if part is not None else embedded_file.data
+    if genai_types is not None and hasattr(genai_types, "Content"):
+        contents: Any = genai_types.Content(parts=[part])
+    else:
+        import base64
+
+        contents = {
+            "parts": [
+                {
+                    "inline_data": {
+                        "mime_type": embedded_file.mime_type,
+                        "data": base64.b64encode(embedded_file.data).decode("utf-8"),
+                    }
+                }
+            ]
+        }
+
     response = client.models.embed_content(model=model, contents=contents)
     return _extract_embedding_vector(response)
 
@@ -169,10 +247,10 @@ class GeminiEmbeddingClient:
         self.model = model
 
     def embed_file(self, path: str | Path) -> list[float]:
-        return embed_file(self.client, path, model=self.model)
+        return _with_retry(lambda: embed_file(self.client, path, model=self.model))
 
     def embed_text(self, text: str) -> list[float]:
-        return embed_text(self.client, text, model=self.model)
+        return _with_retry(lambda: embed_text(self.client, text, model=self.model))
 
     def embed_texts(self, texts: Sequence[str]) -> list[list[float]]:
         return [self.embed_text(text) for text in texts]
