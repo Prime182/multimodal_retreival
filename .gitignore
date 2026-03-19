@@ -8,3 +8,4 @@ backend/data/
 frontend/node_modules/
 frontend/dist/
 pdfs/
+.vscode/

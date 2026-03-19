@@ -1,3 +1,18 @@
+"""
+backend/src/multimodal/ingestion/section.py
+
+Section span detection.
+
+Since pymupdf4llm does not populate page_boxes by default, blocks are [].
+build_section_spans_from_blocks falls back to scanning page.text for
+heading lines using detect_heading(), which is the same heuristic used
+by the text chunker.
+
+resolve_section()         — line-index based  (used by text & equation)
+resolve_section_spatial() — bbox based        (used by table & image)
+Both are kept so callers don't need changing.
+"""
+
 from __future__ import annotations
 
 import re
@@ -8,25 +23,29 @@ from ..types import PageBlocks, SectionSpan
 
 _HEADING_NUMBER_RE = re.compile(r"^\s*((\d+(\.\d+)*)\.?|[IVXLC]+\.?)\s+[A-Z]")
 _KNOWN_SECTION_NAMES = {
-    "abstract",
-    "introduction",
-    "background",
-    "methods",
-    "materials and methods",
-    "results",
-    "discussion",
-    "conclusion",
-    "conclusions",
-    "references",
-    "appendix",
+    "abstract", "introduction", "background",
+    "methods", "materials and methods",
+    "results", "discussion",
+    "conclusion", "conclusions",
+    "references", "appendix",
 }
 _CAPTION_PREFIXES = {"figure", "fig", "table", "scheme"}
 _MATH_SYMBOLS = frozenset("=<>±∑∫√≈≠≤≥∞∂∆∇λμσπθβα^")
 
 
+# ── Span building ──────────────────────────────────────────────────────────────
+
 def build_section_spans_from_blocks(pages: list[PageBlocks]) -> list[SectionSpan]:
-    spans = []
-    # Start with a default Document span if there are pages
+    """
+    Build SectionSpan list from page data.
+
+    Primary:  reads block["type"] == "section_header" / "header" from page.blocks
+              (only available if pymupdf4llm is configured to return page_boxes).
+    Fallback: scans page.text line by line with detect_heading()
+              (always available — this is the usual path).
+    """
+    spans: list[SectionSpan] = []
+
     if pages:
         spans.append(SectionSpan(
             page_number=pages[0].page_number,
@@ -37,76 +56,56 @@ def build_section_spans_from_blocks(pages: list[PageBlocks]) -> list[SectionSpan
         ))
 
     for page in pages:
+        # ── Try block-based detection first ───────────────────────────────────
+        block_spans_found = False
         for block in page.blocks:
             if not isinstance(block, dict) or "type" not in block:
                 continue
-            if block["type"] in ("section_header", "header"):
-                if "bbox" not in block:
-                    continue
-                x0, y0, x1, y1 = block["bbox"]
-                # Detect column: if x0 > page_width / 2 → right column
-                column = 1 if x0 > page.width / 2 else 0
-                section_name = block["text"].strip()
-                if not section_name:
-                    continue
-                    
-                spans.append(SectionSpan(
-                    page_number=page.page_number,
-                    bbox=tuple(block["bbox"]),
-                    line_start=int(y0),  # use y0 as "line" for backward compatibility if needed
-                    section_name=section_name,
-                    column=column,
-                ))
+            if block["type"] not in ("section_header", "header"):
+                continue
+            if "bbox" not in block:
+                continue
+            x0, y0, x1, y1 = block["bbox"]
+            section_name = block.get("text", "").strip()
+            if not section_name:
+                continue
+            column = 1 if page.width > 0 and x0 > page.width / 2 else 0
+            spans.append(SectionSpan(
+                page_number=page.page_number,
+                bbox=tuple(block["bbox"]),
+                line_start=int(y0),
+                section_name=section_name,
+                column=column,
+            ))
+            block_spans_found = True
+
+        # ── Fallback: scan page.text for heading lines ────────────────────────
+        if not block_spans_found and page.text:
+            for line_index, raw_line in enumerate(page.text.splitlines()):
+                heading = detect_heading(raw_line.strip())
+                if heading:
+                    spans.append(SectionSpan(
+                        page_number=page.page_number,
+                        bbox=(0.0, float(line_index * 10), page.width, float(line_index * 10 + 10)),
+                        line_start=line_index,
+                        section_name=heading,
+                        column=0,
+                    ))
+
     return spans
 
 
-def resolve_section_spatial(
-    page_number: int,
-    bbox: tuple[float, float, float, float],
-    spans: Sequence[SectionSpan],
-) -> str | None:
-    """Matches sections by page and spatial proximity (Y position)."""
-    x0, y0, x1, y1 = bbox
-    result: str | None = None
-    
-    # Sections are generally ordered by page and then by Y
-    for span in spans:
-        if span.page_number > page_number:
-            break
-        
-        # If on the same page, we need to consider reading order (column then Y)
-        if span.page_number == page_number:
-            # If the span is in a later column, it hasn't started for this column yet
-            # (Assuming sections don't typically span across columns in a way that breaks this simple logic)
-            span_x0 = span.bbox[0]
-            # Simple column check for the span itself if it wasn't pre-calculated
-            # but we have it in SectionSpan.column
-            
-            # If current block is in col 0 and span is in col 1, skip
-            block_column = 1 if x0 > 300 else 0 # Rough midpoint if page width not available
-            # Ideally we'd use page.width but here we just have bbox. 
-            # Most PDFs are ~600pts wide.
-            
-            if span.column > 0 and x0 < 300: # span is in right col, but we are in left col
-                continue
-            
-            if span.bbox[1] > y0: # span starts below current block
-                if span.column == 0 and x0 > 300: # span in left col, we are in right col
-                    # This span might still be the current one if it's the latest one from left col
-                    pass
-                else:
-                    break
-                    
-        result = span.section_name
-    return result
-
+# ── Resolution helpers ─────────────────────────────────────────────────────────
 
 def resolve_section(
     page_number: int,
     line_index: int,
     spans: Sequence[SectionSpan],
 ) -> str | None:
-    # Kept for backward compatibility during transition if needed
+    """
+    Return the active section name at (page_number, line_index).
+    Uses integer line_start comparison — safe to call from text & equation paths.
+    """
     result: str | None = None
     for span in spans:
         if span.page_number > page_number:
@@ -117,36 +116,69 @@ def resolve_section(
     return result
 
 
+def resolve_section_spatial(
+    page_number: int,
+    bbox: tuple[float, float, float, float],
+    spans: Sequence[SectionSpan],
+) -> str | None:
+    """
+    Return the active section name at (page_number, bbox).
+    bbox = (x0, y0, x1, y1).  Uses y0 for ordering within a page.
+    Safe to call from table & image paths.
+    """
+    _x0, y0, _x1, _y1 = bbox
+    result: str | None = None
+    for span in spans:
+        if span.page_number > page_number:
+            break
+        if span.page_number == page_number and span.line_start > y0:
+            break
+        result = span.section_name
+    return result
+
+
+# ── Heading detector ───────────────────────────────────────────────────────────
+
 def detect_heading(line: str) -> str | None:
+    """
+    Return a normalised heading string if `line` looks like a section heading,
+    otherwise None.
+    """
     stripped = line.strip()
-    if not stripped or len(stripped) > 100:
+    if not stripped or len(stripped) > 120:
         return None
 
     words = stripped.split()
-    if len(words) == 0 or len(words) > 10:
+    if len(words) == 0 or len(words) > 12:
         return None
 
+    # Caption lines ("Figure 1 ...", "Table 2 ...") are not headings
     if words[0].lower().rstrip(".") in _CAPTION_PREFIXES:
         return None
-    if any(char in _MATH_SYMBOLS for char in stripped):
+
+    # Lines with math symbols are not headings
+    if any(ch in _MATH_SYMBOLS for ch in stripped):
         return None
 
     normalized = re.sub(r"[:.]+$", "", stripped).strip()
     lowered = normalized.lower()
+
+    # Known section name (exact)
     if lowered in _KNOWN_SECTION_NAMES:
         return normalized.title()
-    compact = normalized.replace(" ", "").lower()
-    if compact in _KNOWN_SECTION_NAMES and all(len(word) == 1 for word in normalized.split()):
-        return compact.title()
+
+    # Numbered heading: "1 Introduction", "2.3 Methods", "IV Results"
     if _HEADING_NUMBER_RE.match(normalized):
         return normalized
 
-    non_space = [char for char in stripped if not char.isspace()]
-    if non_space and sum(char.isdigit() for char in non_space) / len(non_space) > 0.35:
-        return None
+    # ALL-CAPS heading (3–80 chars, ≤ 6 words)
+    non_space = [ch for ch in stripped if not ch.isspace()]
+    if non_space:
+        digit_ratio = sum(ch.isdigit() for ch in non_space) / len(non_space)
+        if digit_ratio > 0.35:
+            return None
     if stripped[:-1] and re.search(r"[.?!]", stripped[:-1]):
         return None
-
     if normalized.isupper() and 3 <= len(normalized) <= 80 and len(words) <= 6:
         return normalized.title()
 
