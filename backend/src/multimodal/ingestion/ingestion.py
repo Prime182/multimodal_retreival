@@ -5,10 +5,10 @@ from pathlib import Path
 from ..types import IngestedDocument, build_document_id, parse_pdf_filename
 from .equation import extract_equations
 from .image import extract_images
-from .section import build_section_spans
+from .section import build_section_spans_from_blocks
 from .table import build_table_text_exclusion, extract_tables
 from .text import build_text_chunks
-from .utils import ensure_file_exists, extract_page_text
+from .utils import ensure_file_exists, extract_page_blocks
 
 
 class PDFIngestionAgent:
@@ -32,8 +32,8 @@ class PDFIngestionAgent:
         image_dir = assets_root / document_id / "images"
         image_dir.mkdir(parents=True, exist_ok=True)
 
-        pages = extract_page_text(source_pdf)
-        spans = build_section_spans(pages)
+        pages = extract_page_blocks(source_pdf)
+        spans = build_section_spans_from_blocks(pages)
         cell_exclusion, row_exclusion = build_table_text_exclusion(source_pdf)
 
         return IngestedDocument(

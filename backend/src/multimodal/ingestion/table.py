@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 from pathlib import Path
 from typing import Sequence
 
@@ -10,9 +11,9 @@ try:
 except ImportError:  # pragma: no cover - verified at runtime.
     pdfplumber = None  # type: ignore[assignment]
 
-from ..types import TableChunk
-from .section import SectionSpan, resolve_section
-from .utils import PageText, normalise_line
+from ..types import PageBlocks, TableChunk
+from .section import SectionSpan, resolve_section_spatial
+from .utils import normalise_line
 
 
 def build_table_text_exclusion(pdf_path: Path) -> tuple[set[str], set[str]]:
@@ -43,7 +44,7 @@ def build_table_text_exclusion(pdf_path: Path) -> tuple[set[str], set[str]]:
 def extract_tables(
     *,
     pdf_path: Path,
-    pages: Sequence[PageText],
+    pages: Sequence[PageBlocks],
     spans: Sequence[SectionSpan],
     journal_id: str,
     article_id: str,
@@ -56,6 +57,8 @@ def extract_tables(
         page.page_number: page.text.splitlines()
         for page in pages
     }
+    page_widths = {page.page_number: page.width for page in pages}
+    page_heights = {page.page_number: page.height for page in pages}
 
     chunks: list[TableChunk] = []
     with pdfplumber.open(str(pdf_path)) as pdf:
@@ -73,13 +76,27 @@ def extract_tables(
                 header = normalized_rows[0]
                 data_rows = normalized_rows[1:]
 
-                if table_index < len(table_objects):
-                    top_y = table_objects[table_index].bbox[1]
-                    line_pos = max(0, int(top_y / 12))
+                table_bbox = None
+                if table_index < len(table_objects) and table_objects[table_index].bbox:
+                    x0, y0, x1, y1 = table_objects[table_index].bbox
+                    table_bbox = (float(x0), float(y0), float(x1), float(y1))
+                    
                 else:
-                    line_pos = _estimate_line_position(header, page_lines.get(page_index, []))
+                    # Fallback to estimating a bbox if pdfplumber didn't provide one readily
+                    # This is a heuristic and might not be accurate.
+                    page_width = page_widths.get(page_index, 600.0)
+                    page_height = page_heights.get(page_index, 800.0)
+                    # Estimate position based on header, and assign a rough bbox
+                    estimated_line_pos = _estimate_line_position(header, page_lines.get(page_index, []))
+                    estimated_y0 = estimated_line_pos * 10.0 # Assuming 10 units per line
+                    table_bbox = (50.0, estimated_y0, page_width - 50.0, estimated_y0 + 50.0) # A rough block
 
-                section = resolve_section(page_index, line_pos, spans)
+                section = resolve_section_spatial(page_index, table_bbox, spans) if table_bbox else None
+                caption = _find_table_caption(
+                    table_index + 1,
+                    int(table_bbox[1] / 10) if table_bbox else 0, # Pass estimated line pos to old caption finder
+                    page_lines.get(page_index, []),
+                )
 
                 if len(data_rows) <= 20:
                     csv_data = _table_to_csv([header, *data_rows])
@@ -91,6 +108,7 @@ def extract_tables(
                             source_path=source_path,
                             csv_data=csv_data,
                             header=",".join(header),
+                            caption=caption,
                             row_index=None,
                             page_number=page_index,
                             section=section,
@@ -108,6 +126,7 @@ def extract_tables(
                             source_path=source_path,
                             csv_data=csv_data,
                             header=",".join(header),
+                            caption=caption,
                             row_index=row_index,
                             page_number=page_index,
                             section=section,
@@ -151,3 +170,24 @@ def _estimate_line_position(header_row: Sequence[str], page_lines: Sequence[str]
             return index
 
     return 0
+
+
+def _find_table_caption(
+    table_idx: int,
+    line_position: int,
+    page_lines: Sequence[str],
+) -> str | None:
+    search_start = max(0, line_position - 5)
+    search_window = page_lines[search_start:line_position + 2]
+    indexed_pattern = re.compile(rf"\bTable\s+{table_idx}\b", re.IGNORECASE)
+    any_pattern = re.compile(r"\bTable\s+\d+\b", re.IGNORECASE)
+
+    for line in search_window:
+        stripped = line.strip()
+        if indexed_pattern.search(stripped):
+            return stripped
+    for line in search_window:
+        stripped = line.strip()
+        if any_pattern.search(stripped):
+            return stripped
+    return None

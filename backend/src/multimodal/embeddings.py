@@ -182,7 +182,7 @@ def embed_file(
     part = _build_part(embedded_file.data, embedded_file.mime_type)
 
     if genai_types is not None and hasattr(genai_types, "Content"):
-        contents: Any = genai_types.Content(parts=[part])
+        contents: Any = genai_types.Content(role="user", parts=[part])
     else:
         import base64
 

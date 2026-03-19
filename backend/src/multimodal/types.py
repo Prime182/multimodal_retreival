@@ -29,6 +29,24 @@ def build_document_id(path: str | Path) -> str:
 
 
 @dataclass(slots=True)
+class PageBlocks:
+    page_number: int
+    text: str
+    blocks: list[dict[str, Any]]
+    width: float
+    height: float
+
+
+@dataclass(slots=True, frozen=True)
+class SectionSpan:
+    page_number: int
+    bbox: tuple[float, float, float, float]  # (x0, y0, x1, y1)
+    line_start: int  # keep for backward compat or use as y0
+    section_name: str
+    column: int  # 0 = left, 1 = right (for 2-col layouts)
+
+
+@dataclass(slots=True)
 class TextChunk:
     chunk_id: str
     journal_id: str
@@ -40,11 +58,15 @@ class TextChunk:
     page_end: int
     section: str | None = None
     caption: str | None = None
+    bbox: tuple[float, float, float, float] | None = None
+    column: int | None = None
+    block_type: str | None = None
     content_type: ContentType = "text"
 
     @property
     def embed_text(self) -> str:
-        parts = [self.section, self.text]
+        col_hint = f"Column {self.column + 1}" if self.column is not None else None
+        parts = [self.section, col_hint, self.text]
         return "\n\n".join(part for part in parts if part)
 
     def metadata(self) -> dict[str, Any]:
@@ -63,11 +85,14 @@ class EquationChunk:
     context: str | None = None
     page_number: int | None = None
     section: str | None = None
+    bbox: tuple[float, float, float, float] | None = None
+    column: int | None = None
     content_type: ContentType = "equation"
 
     @property
     def embed_text(self) -> str:
-        parts = [self.section, self.context, self.latex]
+        col_hint = f"Column {self.column + 1}" if self.column is not None else None
+        parts = [self.section, col_hint, self.context, self.latex]
         return "\n\n".join(part for part in parts if part)
 
     def metadata(self) -> dict[str, Any]:
@@ -84,14 +109,18 @@ class TableChunk:
     source_path: str
     csv_data: str
     header: str
+    caption: str | None = None
     row_index: int | None = None
     page_number: int | None = None
     section: str | None = None
+    bbox: tuple[float, float, float, float] | None = None
+    column: int | None = None
     content_type: ContentType = "table"
 
     @property
     def embed_text(self) -> str:
-        parts = [self.section, self.header, self.csv_data]
+        col_hint = f"Column {self.column + 1}" if self.column is not None else None
+        parts = [self.section, col_hint, self.caption, self.header, self.csv_data]
         return "\n\n".join(part for part in parts if part)
 
     def metadata(self) -> dict[str, Any]:

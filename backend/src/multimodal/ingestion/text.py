@@ -2,14 +2,14 @@ from __future__ import annotations
 
 from typing import Sequence
 
-from ..types import TextChunk
-from .section import SectionSpan, detect_heading, resolve_section
-from .utils import PageText, estimate_tokens, tokenize
+from ..types import PageBlocks, SectionSpan, TextChunk
+from .section import detect_heading, resolve_section_spatial
+from .utils import estimate_tokens, tokenize
 
 
-def build_text_chunks(
+def build_text_chunks_layout_aware(
     *,
-    pages: Sequence[PageText],
+    pages: list[PageBlocks],
     spans: Sequence[SectionSpan],
     journal_id: str,
     article_id: str,
@@ -17,6 +17,120 @@ def build_text_chunks(
     token_limit: int,
 ) -> list[TextChunk]:
     chunks: list[TextChunk] = []
+
+    for page in pages:
+        # Group blocks by column (left vs right)
+        # Using a fixed midpoint or page.width / 2
+        midpoint = page.width / 2 if page.width > 0 else 300
+        
+        left_blocks = [
+            b for b in page.blocks 
+            if isinstance(b, dict) and b.get("type") == "text" and "bbox" in b and b["bbox"][0] < midpoint
+        ]
+        right_blocks = [
+            b for b in page.blocks 
+            if isinstance(b, dict) and b.get("type") == "text" and "bbox" in b and b["bbox"][0] >= midpoint
+        ]
+
+        for column_idx, column_blocks in enumerate([left_blocks, right_blocks]):
+            if not column_blocks:
+                continue
+                
+            # Sort by Y position (top-to-bottom reading order)
+            sorted_blocks = sorted(column_blocks, key=lambda b: b["bbox"][1])
+            
+            buffer_text = []
+            buffer_tokens = 0
+            current_section = None
+            buffer_bbox = None
+
+            def flush_buffer(sect, col, b_text, b_tokens, b_bbox):
+                if not b_text:
+                    return
+                text = " ".join(b_text).strip()
+                if not text:
+                    return
+                
+                chunks.append(
+                    TextChunk(
+                        chunk_id=f"{journal_id}_{article_id}_text_{len(chunks) + 1:05d}",
+                        journal_id=journal_id,
+                        article_id=article_id,
+                        source_path=source_path,
+                        text=text,
+                        token_count=estimate_tokens(text),
+                        page_start=page.page_number,
+                        page_end=page.page_number,
+                        section=sect,
+                        caption=_build_text_caption(sect, page.page_number, page.page_number),
+                        bbox=b_bbox,
+                        column=col,
+                        block_type="text"
+                    )
+                )
+
+            for block in sorted_blocks:
+                block_text = block["text"].strip()
+                if not block_text:
+                    continue
+                
+                block_bbox = tuple(block["bbox"])
+                section = resolve_section_spatial(page.page_number, block_bbox, spans)
+                block_tokens = estimate_tokens(block_text)
+
+                # If section changed or token limit exceeded, flush
+                if (current_section is not None and section != current_section) or \
+                   (buffer_tokens + block_tokens > token_limit):
+                    flush_buffer(current_section, column_idx, buffer_text, buffer_tokens, buffer_bbox)
+                    buffer_text = []
+                    buffer_tokens = 0
+                    buffer_bbox = None
+
+                current_section = section
+                buffer_text.append(block_text)
+                buffer_tokens += block_tokens
+                if buffer_bbox is None:
+                    buffer_bbox = block_bbox
+                else:
+                    # Update bounding box to encompass the new block
+                    buffer_bbox = (
+                        min(buffer_bbox[0], block_bbox[0]),
+                        min(buffer_bbox[1], block_bbox[1]),
+                        max(buffer_bbox[2], block_bbox[2]),
+                        max(buffer_bbox[3], block_bbox[3])
+                    )
+
+            flush_buffer(current_section, column_idx, buffer_text, buffer_tokens, buffer_bbox)
+
+    return chunks
+
+
+def build_text_chunks(
+    *,
+    pages: Sequence[any],  # Generic to avoid type conflict during transition
+    spans: Sequence[SectionSpan],
+    journal_id: str,
+    article_id: str,
+    source_path: str,
+    token_limit: int,
+) -> list[TextChunk]:
+    # This is the original function, redirected to layout-aware if we have PageBlocks
+    if pages and isinstance(pages[0], PageBlocks):
+        return build_text_chunks_layout_aware(
+            pages=list(pages),
+            spans=spans,
+            journal_id=journal_id,
+            article_id=article_id,
+            source_path=source_path,
+            token_limit=token_limit
+        )
+    
+    # This part was accidentally modified with comments instead of keeping the fallback logic.
+    # We've already implemented build_text_chunks_layout_aware, which is the preferred way.
+    # We will ensure this function calls it correctly if PageBlocks are provided.
+
+    chunks: list[TextChunk] = []
+
     buffer_lines: list[str] = []
     buffer_pages: list[int] = []
     buffer_tokens = 0
@@ -56,7 +170,7 @@ def build_text_chunks(
 
         for line_index, raw_line in enumerate(page.text.splitlines()):
             stripped = raw_line.strip()
-            section = resolve_section(page.page_number, line_index, spans)
+            section = resolve_section_spatial(page.page_number, line_index, spans)
 
             if detect_heading(stripped):
                 flush()

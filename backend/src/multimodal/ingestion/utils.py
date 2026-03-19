@@ -5,19 +5,14 @@ import re
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
+import pymupdf
+import pymupdf4llm
+from ..types import PageBlocks
 
 
 _TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]", re.UNICODE)
-
-
-@dataclass(slots=True)
-class PageText:
-    page_number: int
-    text: str
-    token_count: int
 
 
 def tokenize(text: str) -> list[str]:
@@ -29,39 +24,75 @@ def estimate_tokens(text: str) -> int:
 
 
 def normalise_line(line: str) -> str:
-    return re.sub(r"\s+", " ", line).strip().lower()
+    text = line.replace("±", " +/- ")
+    text = re.sub(r"\+\s*/\s*-", " +/- ", text)
+    text = re.sub(r"\s+", " ", text).strip().lower()
+    return text.replace("+/-", " plusminus ")
 
 
-def extract_page_text(pdf_path: Path) -> list[PageText]:
-    require_command("pdftotext")
+def extract_page_blocks(pdf_path: Path) -> list[PageBlocks]:
+    """Returns layout-aware blocks with bounding boxes per page."""
+    chunks = pymupdf4llm.to_markdown(
+        str(pdf_path),
+        page_chunks=True,  # one dict per page
+        show_progress=False,
+    )
+    
+    # We also need page dimensions for column detection
+    doc = pymupdf.open(str(pdf_path))
+    
+    pages = []
+    for chunk in chunks:
+        # metadata["page"] is 0-indexed in pymupdf4llm, but we want 1-indexed
+        # Fallback to 'page_number' if 'page' is not found, or use a default if neither is present.
+        # NOTE: 'page_number' in chunk['metadata'] seems to be 1-indexed!
+        if "page" in chunk["metadata"]:
+            page_idx = chunk["metadata"]["page"]
+            page_num = page_idx + 1
+        elif "page_number" in chunk["metadata"]:
+            page_num = chunk["metadata"]["page_number"]
+            page_idx = page_num - 1
+        else:
+            page_idx = 0
+            page_num = 1
 
-    with tempfile.NamedTemporaryFile(mode="w+b", suffix=".txt", delete=False) as handle:
-        output_path = Path(handle.name)
+        # Normalize blocks: pymupdf4llm uses "class" instead of "type" in some versions/configs
+        raw_blocks = chunk.get("page_boxes", [])
+        blocks = []
+        for b in raw_blocks:
+            if not isinstance(b, dict):
+                continue
+            # Ensure "type" exists and map from "class" if needed
+            if "type" not in b and "class" in b:
+                b["type"] = b["class"]
+            # Ensure "text" exists and map from "text" or just empty string
+            if "text" not in b:
+                # We might need to extract text from the markdown if it's not in the box
+                # but usually it should be there. Let's look at the chunk text if needed.
+                # For now just ensure it's a string.
+                b["text"] = b.get("text", "")
+            blocks.append(b)
 
-    try:
-        command = [
-            "pdftotext",
-            "-layout",
-            "-enc",
-            "UTF-8",
-            "-eol",
-            "unix",
-            str(pdf_path),
-            str(output_path),
-        ]
-        run_command(command, "extracting text from PDF")
-        raw_text = output_path.read_text(encoding="utf-8", errors="replace")
-    finally:
-        output_path.unlink(missing_ok=True)
+        # Ensure page_idx is within valid range
 
-    return [
-        PageText(
-            page_number=page_number,
-            text=page_text.strip(),
-            token_count=estimate_tokens(page_text.strip()),
-        )
-        for page_number, page_text in enumerate(raw_text.split("\f"), start=1)
-    ]
+        if not (0 <= page_idx < doc.page_count):
+            print(f"[WARN] Invalid page_idx: {page_idx}, doc.page_count: {doc.page_count}. Skipping chunk.")
+            continue
+        
+        # Get page dimensions
+        pdf_page = doc.load_page(page_idx)
+        width = pdf_page.rect.width
+        height = pdf_page.rect.height
+        
+        pages.append(PageBlocks(
+            page_number=page_num,
+            text=chunk["text"],
+            blocks=blocks,  # [{type, bbox, text}, ...]
+            width=width,
+            height=height,
+        ))
+    doc.close()
+    return pages
 
 
 def ensure_file_exists(path: Path) -> None:

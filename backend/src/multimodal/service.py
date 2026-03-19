@@ -70,6 +70,9 @@ class MultimodalRetrievalService:
             for image in document.images:
                 try:
                     embedding = self.embedding_client.embed_file(image.file_path)
+                    if image.caption:
+                        caption_embedding = self.embedding_client.embed_text(image.caption)
+                        embedding = _blend_embeddings(embedding, caption_embedding)
                 except Exception as exc:
                     print(f"[WARN] Could not embed image {image.file_path}: {exc}")
                     continue
@@ -93,3 +96,23 @@ class MultimodalRetrievalService:
 
     def search_images(self, query: str, limit: int = 5) -> list[SearchResult]:
         return self.search(query, limit=limit, content_types=["image"])
+
+
+def _blend_embeddings(
+    image_embedding: list[float],
+    caption_embedding: list[float],
+    *,
+    image_weight: float = 0.7,
+    caption_weight: float = 0.3,
+) -> list[float]:
+    if len(image_embedding) != len(caption_embedding):
+        return image_embedding
+
+    total_weight = image_weight + caption_weight
+    if total_weight == 0:
+        return image_embedding
+
+    return [
+        ((image_value * image_weight) + (caption_value * caption_weight)) / total_weight
+        for image_value, caption_value in zip(image_embedding, caption_embedding)
+    ]

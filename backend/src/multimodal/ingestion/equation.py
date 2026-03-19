@@ -1,14 +1,23 @@
+"""Equation detection and extraction.
+
+Core principle
+--------------
+An equation line is one that is composed predominantly of mathematical
+notation with minimal natural language. Clinical papers contain many
+math-like fragments (p-values, sample sizes, lab values), so checking only
+for the presence of operators is too permissive.
+"""
+
 from __future__ import annotations
 
 import re
 from typing import Sequence
 
-from ..types import EquationChunk
-from .section import SectionSpan, resolve_section
-from .utils import PageText, normalise_line
+from ..types import EquationChunk, PageBlocks, SectionSpan
+from .section import detect_heading, resolve_section_spatial
+from .utils import normalise_line
 
 
-_MATH_SYMBOLS = frozenset("=<>±∑∫√≈≠≤≥∞∂∆∇λμσπθβα^")
 _LATEX_MARKERS = (
     "\\frac",
     "\\sum",
@@ -21,57 +30,151 @@ _LATEX_MARKERS = (
     "\\sigma",
     "\\pi",
     "\\sqrt",
+    "\\begin",
+    "\\end",
+    "\\left",
+    "\\right",
 )
-_PROSE_VETO_WORDS = {
-    "the",
-    "and",
-    "that",
-    "this",
-    "with",
-    "from",
-    "have",
-    "which",
-    "their",
-    "were",
-    "been",
-    "than",
-    "these",
-    "those",
-    "however",
-    "therefore",
-    "although",
-    "results",
-    "figure",
-    "table",
-    "study",
-    "patients",
-    "participants",
-    "data",
-    "analysis",
-    "treatment",
-}
-_MATH_CONTEXT_WORDS = {
-    "equation",
-    "formula",
-    "integral",
-    "derivative",
-    "matrix",
-    "vector",
-    "scalar",
-    "coefficient",
-    "eigenvalue",
-    "function",
-    "polynomial",
-    "theorem",
-    "proof",
-    "lemma",
-}
-_OPERAND_PATTERN = r"(?:[A-Za-z][A-Za-z0-9_/]*(?:\^\d+)?|\d[\d.]*(?:[A-Za-z]{0,3})?)"
+
+_HARD_VETO_WORDS: frozenset[str] = frozenset(
+    {
+        "renal",
+        "allograft",
+        "hepatic",
+        "viral",
+        "serum",
+        "plasma",
+        "patients",
+        "patient",
+        "participants",
+        "recipients",
+        "treatment",
+        "therapy",
+        "survival",
+        "function",
+        "toxicity",
+        "efficacy",
+        "transplant",
+        "months",
+        "years",
+        "weeks",
+        "days",
+        "hours",
+        "clinical",
+        "medical",
+        "surgical",
+        "laboratory",
+        "egfr",
+        "hbv",
+        "hbsag",
+        "hbeag",
+        "alt",
+        "ast",
+        "afp",
+        "ml/min",
+        "iu/ml",
+        "u/l",
+        "mmol/l",
+        "umol/l",
+        "ml/min/year",
+        "dna",
+        "rna",
+        "pcr",
+        "elisa",
+        "compared",
+        "showed",
+        "demonstrated",
+        "observed",
+        "reported",
+        "significant",
+        "difference",
+        "association",
+        "correlation",
+        "baseline",
+        "respectively",
+        "analysis",
+        "result",
+        "results",
+        "mean",
+        "median",
+        "group",
+        "control",
+        "total",
+        "stable",
+        "remained",
+        "value",
+        "values",
+        "experienced",
+        "naive",
+        "the",
+        "and",
+        "that",
+        "this",
+        "vs",
+        "with",
+        "from",
+        "have",
+        "which",
+        "their",
+        "were",
+        "been",
+        "than",
+        "these",
+        "those",
+        "however",
+        "therefore",
+        "although",
+        "during",
+        "after",
+        "before",
+        "between",
+        "among",
+        "within",
+        "while",
+        "because",
+        "since",
+        "also",
+        "both",
+        "further",
+        "follow-up",
+        "followup",
+        "overall",
+    }
+)
+
+_MATH_IDENTIFIERS: frozenset[str] = frozenset(
+    {
+        "sin",
+        "cos",
+        "tan",
+        "log",
+        "exp",
+        "det",
+        "div",
+        "inf",
+        "max",
+        "min",
+        "mod",
+        "arg",
+        "sgn",
+        "var",
+        "cov",
+        "std",
+        "lim",
+        "sup",
+        "deg",
+    }
+)
+
+_STATISTICAL_NOTATION_RE = re.compile(
+    r"^\s*(?:p|n)\s*[=<>]\s*(?:\d+|0?\.\d+|ns)\s*$",
+    re.IGNORECASE,
+)
 
 
 def extract_equations(
     *,
-    pages: Sequence[PageText],
+    pages: Sequence[PageBlocks],
     spans: Sequence[SectionSpan],
     journal_id: str,
     article_id: str,
@@ -82,14 +185,17 @@ def extract_equations(
     chunks: list[EquationChunk] = []
 
     for page in pages:
+        # Use page.text (markdown-ish from pymupdf4llm)
         lines = [line.rstrip() for line in page.text.splitlines()]
         block: list[str] = []
         block_start = 0
+        block_section: str | None = None
 
         def flush(end_index: int) -> None:
-            nonlocal block, block_start
+            nonlocal block, block_start, block_section
             if not block:
                 return
+
             latex = "\n".join(line.strip() for line in block if line.strip()).strip()
             if latex:
                 chunks.append(
@@ -101,20 +207,26 @@ def extract_equations(
                         latex=latex,
                         context=_extract_context(lines, block_start, end_index),
                         page_number=page.page_number,
-                        section=resolve_section(page.page_number, block_start, spans),
+                        section=block_section,
                     )
                 )
+
             block = []
             block_start = 0
+            block_section = None
 
         for index, line in enumerate(lines):
-            normalised = normalise_line(line)
-
-            if normalised in row_exclusion:
+            stripped = line.strip()
+            if detect_heading(stripped):
                 flush(index)
                 continue
 
-            cell_hits = sum(1 for cell in cell_exclusion if len(cell) > 3 and cell in normalised)
+            norm = normalise_line(line)
+            if norm in row_exclusion:
+                flush(index)
+                continue
+
+            cell_hits = sum(1 for cell in cell_exclusion if len(cell) > 3 and cell in norm)
             if cell_hits >= 2:
                 flush(index)
                 continue
@@ -122,6 +234,11 @@ def extract_equations(
             if is_equation_line(line):
                 if not block:
                     block_start = index
+                    # Fallback coordinate if not easily available from line index
+                    # In a real scenario, we might want to map line_index back to blocks
+                    # For now, we use a middle-ish bbox for section resolution
+                    pseudo_bbox = (100, index * 10, 500, index * 10 + 10)
+                    block_section = resolve_section_spatial(page.page_number, pseudo_bbox, spans)
                 block.append(line)
                 continue
 
@@ -133,61 +250,96 @@ def extract_equations(
 
 
 def is_equation_line(line: str) -> bool:
+    """Return True only when the line is predominantly mathematical notation."""
+
     stripped = line.strip()
     if len(stripped) < 3:
-        return False
-
-    lower_tokens = {token.lower().strip(".,;:()[]") for token in stripped.split()}
-    prose_hits = lower_tokens & _PROSE_VETO_WORDS
-    if len(prose_hits) > 2:
-        return False
-    if len(stripped.split()) > 12 and prose_hits:
         return False
 
     if any(marker in stripped for marker in _LATEX_MARKERS):
         return True
 
-    score = 0
+    if _STATISTICAL_NOTATION_RE.match(stripped):
+        return False
 
-    non_space = [char for char in stripped if not char.isspace()]
-    if non_space and sum(char in _MATH_SYMBOLS for char in non_space) / len(non_space) >= 0.30:
-        score += 1
+    lower_tokens = {
+        token.lower().strip(".,;:()[]{}\"'%-+*/^=<>")
+        for token in stripped.split()
+    }
+    if lower_tokens & _HARD_VETO_WORDS:
+        return False
 
-    numeric_eq = re.search(
-        r"(?<!\w)([A-Za-z]{1,4}|\d[\d.,]*)\s*[=<>]\s*(\d[\d.,]*[A-Za-z]{0,3}|[A-Za-z]{1,4})(?!\w)",
-        stripped,
-    )
-    symbolic_eq = re.search(
-        r"(?<!\w)[A-Za-z][A-Za-z0-9_/^]{0,12}\s*[=<>]\s*[A-Za-z0-9_^./]+\s*(?:[+*/^]|\s+-\s+)\s*[A-Za-z0-9_^./]+",
-        stripped,
-    )
-    if numeric_eq or symbolic_eq:
-        score += 1
+    if not re.search(r"[=<>]", stripped):
+        return False
 
-    if re.search(
-        rf"{_OPERAND_PATTERN}\s*[+*/^]\s*{_OPERAND_PATTERN}",
-        stripped,
-    ) or re.search(
-        rf"{_OPERAND_PATTERN}\s+-\s+{_OPERAND_PATTERN}",
-        stripped,
-    ):
-        score += 1
+    english_count, math_count = _classify_tokens(stripped.split())
+    total = english_count + math_count
+    if total == 0 or math_count < 2:
+        return False
 
-    if lower_tokens & _MATH_CONTEXT_WORDS:
-        score += 1
+    return (math_count / total) >= 0.60
 
-    return score >= 2
+
+def _classify_tokens(tokens: list[str]) -> tuple[int, int]:
+    english = 0
+    math = 0
+
+    for token in tokens:
+        clean = token.strip(".,;:()[]{}\"'")
+        if not clean:
+            continue
+
+        if re.fullmatch(r"[+\-*/=<>^±∑∫√≈≠≤≥∞∂∆∇λμσπθβα|\\]+", clean):
+            math += 1
+            continue
+
+        if re.fullmatch(r"\d[\d.,]*[A-Za-z]{0,4}", clean):
+            math += 1
+            continue
+
+        if re.fullmatch(r"[A-Za-z]{1,2}", clean):
+            math += 1
+            continue
+
+        if clean.lower() in _MATH_IDENTIFIERS:
+            math += 1
+            continue
+
+        if re.fullmatch(r"[A-Za-z]{1,3}_[A-Za-z0-9]{1,3}", clean):
+            math += 1
+            continue
+
+        if re.fullmatch(r"d[A-Za-z]+/d[A-Za-z]+", clean):
+            math += 1
+            continue
+
+        if re.fullmatch(r"[A-Za-z]{1,4}\^?\d+", clean):
+            math += 1
+            continue
+
+        if re.fullmatch(r"\d+[\^e]-?\d+", clean, re.IGNORECASE):
+            math += 1
+            continue
+
+        if re.fullmatch(r"[A-Za-z0-9]+/[A-Za-z0-9]+", clean):
+            math += 1
+            continue
+
+        if len(clean) >= 3 and re.search(r"[A-Za-z]{3}", clean):
+            english += 1
+
+    return english, math
 
 
 def _extract_context(lines: Sequence[str], start: int, end: int) -> str:
-    surrounding = list(lines[max(0, start - 2):start]) + list(lines[end:min(len(lines), end + 2)])
+    surrounding = list(lines[max(0, start - 2):start]) + list(
+        lines[end:min(len(lines), end + 2)]
+    )
     text = " ".join(line.strip() for line in surrounding if line.strip())
     if not text:
         return "Equation extracted from surrounding document context."
 
-    sentences = re.split(r"(?<=[.!?])\s+", text)
-    for sentence in sentences:
-        cleaned = sentence.strip()
-        if cleaned:
-            return cleaned
+    for sentence in re.split(r"(?<=[.!?])\s+", text):
+        if sentence.strip():
+            return sentence.strip()
     return text.strip()
