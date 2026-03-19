@@ -2,15 +2,14 @@
 backend/src/multimodal/ingestion/table.py
 
 Caption-anchored table extraction.
-Every real table in an academic PDF is preceded by a caption like:
-  "Table 1 Clinical characteristics of 39 HBsAg-positive..."
-  "Table 5. Considered Search Space Parameter for All Eight Target Proteins"
 
-Strategy:
-1. Scan the page text for caption lines matching TABLE_CAPTION_RE.
-2. For each caption, locate its y-position on the pdfplumber page.
-3. Crop the page below the caption and extract the table there.
-4. If the caption is at the bottom of a page, check the next page too.
+BUG FIXED: pages[page_number - 1] indexed access assumes the `pages` list
+is sorted in ascending page order AND that page numbers are exactly 1-indexed
+with no gaps. If pymupdf4llm returns chunks out of order (possible with
+complex multi-column PDFs), pages[0] is not necessarily page 1.
+
+Fix: build a dict {page.page_number: page} for O(1) safe lookup by page
+number.  This also makes the code resilient to missing pages (None-safe).
 """
 
 from __future__ import annotations
@@ -31,10 +30,6 @@ from .section import SectionSpan, resolve_section_spatial
 from .utils import normalise_line
 
 
-# Matches table caption lines at the start of a line, e.g.:
-#   "Table 1 Clinical characteristics..."
-#   "Table 5. Considered Search Space..."
-#   "TABLE 2: Binding Affinity..."
 TABLE_CAPTION_RE = re.compile(
     r"^\s*Table\s+\d+[\s.:–-]",
     re.IGNORECASE,
@@ -67,35 +62,24 @@ _SETTINGS_TEXT = {
 
 
 def _find_caption_y(page, caption_text: str) -> float | None:
-    """
-    Return the bottom-y of the caption line on this pdfplumber page.
-    Searches by the "Table N" anchor (robust to spacing/punctuation differences).
-    """
     m = re.match(r"^\s*(Table\s+\d+)", caption_text, re.IGNORECASE)
     if not m:
         return None
-    # e.g. "table5" — normalised for comparison
-    anchor_norm = re.sub(r"\s+", "", m.group(1).lower())  # "table5"
+    anchor_norm = re.sub(r"\s+", "", m.group(1).lower())
 
     words = page.extract_words()
     for i, word in enumerate(words):
         w_norm = re.sub(r"\s+", "", word["text"].lower())
-        # Single token "Table5" or "Table" followed by "5"
         if w_norm == anchor_norm:
             return float(word["bottom"])
         if w_norm == "table" and i + 1 < len(words):
             combined = w_norm + words[i + 1]["text"].lower()
             if combined == anchor_norm:
                 return float(words[i + 1]["bottom"])
-
     return None
 
 
 def _extract_first_table_below_y(page, y: float) -> list[list[str | None]] | None:
-    """
-    Crop the page to the region below y and return the first valid table found,
-    trying line strategy then text strategy.
-    """
     try:
         cropped = page.within_bbox((0, y, page.width, page.height), relative=False)
     except Exception:
@@ -109,12 +93,10 @@ def _extract_first_table_below_y(page, y: float) -> list[list[str | None]] | Non
         valid = [t for t in tables if t and len(t) >= 2]
         if valid:
             return valid[0]
-
     return None
 
 
 def build_table_text_exclusion(pdf_path: Path) -> tuple[set[str], set[str]]:
-    """Build cell/row exclusion sets used by equation detection."""
     if pdfplumber is None:
         return set(), set()
 
@@ -153,17 +135,13 @@ def extract_tables(
     article_id: str,
     source_path: str,
 ) -> list[TableChunk]:
-    """
-    Caption-anchored extraction:
-    1. Find every "Table N ..." caption line in the pymupdf4llm page text.
-    2. Locate that caption on the pdfplumber page by y-position.
-    3. Crop below the caption and extract the table.
-    4. If the caption is at the bottom of a page, try the next page too.
-    """
     if pdfplumber is None:
         raise RuntimeError("pdfplumber is required for table extraction.")
 
-    # Map: page_number (1-indexed) → list of caption strings on that page
+    # FIX: build a dict so lookup by page_number is safe regardless of list order.
+    # Previously: pages[page_number - 1]  ← assumes sorted, 1-indexed, no gaps.
+    page_by_num: dict[int, PageBlocks] = {page.page_number: page for page in pages}
+
     caption_map: dict[int, list[str]] = {}
     for page in pages:
         captions = [
@@ -180,7 +158,7 @@ def extract_tables(
         n_pages = len(pdf.pages)
 
         for page_number, captions in caption_map.items():
-            pdf_page = pdf.pages[page_number - 1]  # 0-indexed
+            pdf_page = pdf.pages[page_number - 1]  # pdfplumber is always 0-indexed
 
             for caption in captions:
                 caption_y = _find_caption_y(pdf_page, caption)
@@ -189,9 +167,8 @@ def extract_tables(
                 if caption_y is not None:
                     raw_table = _extract_first_table_below_y(pdf_page, caption_y)
 
-                # Caption at page bottom → table may start on the next page
                 if raw_table is None and page_number < n_pages:
-                    next_pdf_page = pdf.pages[page_number]  # 0-indexed → next page
+                    next_pdf_page = pdf.pages[page_number]
                     raw_table = _extract_first_table_below_y(next_pdf_page, 0)
 
                 if raw_table is None:
@@ -204,10 +181,12 @@ def extract_tables(
                 header = norm_rows[0]
                 data_rows = norm_rows[1:]
 
-                # Resolve section
-                page_obj = pages[page_number - 1]
-                approx_y = caption_y if caption_y is not None else page_obj.height * 0.3
-                tbox = (0.0, approx_y, page_obj.width, page_obj.height)
+                # FIX: use page_by_num dict instead of pages[page_number - 1].
+                page_obj = page_by_num.get(page_number)
+                page_width = page_obj.width if page_obj else 600.0
+                page_height = page_obj.height if page_obj else 800.0
+                approx_y = caption_y if caption_y is not None else page_height * 0.3
+                tbox = (0.0, approx_y, page_width, page_height)
                 section = resolve_section_spatial(page_number, tbox, spans)
 
                 if len(data_rows) <= 20:

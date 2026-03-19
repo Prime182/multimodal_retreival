@@ -1,3 +1,17 @@
+"""
+backend/src/multimodal/ingestion/image.py
+
+BUG FIXED: pseudo-bbox y0 for spatial section resolution used
+`caption_line_index * 10.0` (hardcoded constant).  section.py
+text-fallback spans store bbox.y0 = line_index * _APPROX_LINE_HEIGHT (12.0).
+resolve_section_spatial() converts y0 back to a line index by dividing by
+_APPROX_LINE_HEIGHT.  Using 10.0 here instead of 12.0 caused a ~20% offset,
+producing wrong section assignments for images.
+
+Fix: import _APPROX_LINE_HEIGHT from section.py and use it for the
+pseudo-bbox construction.
+"""
+
 from __future__ import annotations
 
 import re
@@ -10,7 +24,7 @@ except Exception:  # pragma: no cover - Pillow is optional for metadata only.
     Image = None
 
 from ..types import ExtractedImage, PageBlocks
-from .section import SectionSpan, resolve_section_spatial
+from .section import SectionSpan, _APPROX_LINE_HEIGHT, resolve_section_spatial
 from .utils import require_command, run_command
 
 
@@ -50,9 +64,10 @@ def extract_images(
         ],
         key=_image_sort_key,
     )
-    page_lines = {page.page_number: page.text.splitlines() for page in pages}
-    page_widths = {page.page_number: page.width for page in pages}
-    page_heights = {page.page_number: page.height for page in pages}
+
+    # Build lookup by page_number for safe O(1) access (fixes table.py-style
+    # pages[page_number - 1] unsorted-list assumption).
+    page_by_num: dict[int, PageBlocks] = {page.page_number: page for page in pages}
 
     images: list[ExtractedImage] = []
     for image_index, path in enumerate(extracted_files, start=1):
@@ -62,32 +77,31 @@ def extract_images(
 
         page_number = _infer_page_number(path.name)
         section: str | None = None
-        caption_line_index = 0  # Renamed for clarity
-        caption_bbox: tuple[float, float, float, float] | None = None
         caption: str | None = None
+
         if page_number is not None:
-            lines_on_page = page_lines.get(page_number, [])
+            page_obj = page_by_num.get(page_number)
+            lines_on_page = page_obj.text.splitlines() if page_obj and page_obj.text else []
+            page_width = page_obj.width if page_obj else 600.0
+            page_height = page_obj.height if page_obj else 800.0
+
             caption_line_index = _find_caption_line(image_index, lines_on_page)
-
-            # Create a pseudo-bbox for caption to resolve section spatially
-            # This is a heuristic; more advanced matching would be needed for precise caption bboxes.
-            # Assuming a single column for this pseudo-bbox initially.
-            page_width = page_widths.get(page_number, 600.0) # Default if not found
-            page_height = page_heights.get(page_number, 800.0) # Default if not found
-
-            # Estimate y0 and y1 for the pseudo-bbox based on line index
-            # Assuming average line height of 10 units.
-            y0_estimate = caption_line_index * 10.0
-            y1_estimate = (caption_line_index + 1) * 10.0
-            
-            # Clamp to page dimensions
-            y0_estimate = max(0.0, min(y0_estimate, page_height - 10))
-            y1_estimate = max(10.0, min(y1_estimate, page_height))
-
-            caption_bbox = (50.0, y0_estimate, page_width - 50.0, y1_estimate) # Full width, approximate height
-
-            section = resolve_section_spatial(page_number, caption_bbox, spans) if caption_bbox else None
             caption = _extract_figure_caption(caption_line_index, lines_on_page)
+
+            # FIX: use _APPROX_LINE_HEIGHT (imported from section.py) instead
+            # of the previously hardcoded 10.0.
+            # resolve_section_spatial() converts y0 via int(y0/_APPROX_LINE_HEIGHT)
+            # to compare against span.line_start (a line index). Using the same
+            # constant here ensures the round-trip is exact.
+            pseudo_y0 = float(caption_line_index) * _APPROX_LINE_HEIGHT
+            pseudo_y0 = max(0.0, min(pseudo_y0, page_height - _APPROX_LINE_HEIGHT))
+            pseudo_bbox = (
+                50.0,
+                pseudo_y0,
+                page_width - 50.0,
+                pseudo_y0 + _APPROX_LINE_HEIGHT,
+            )
+            section = resolve_section_spatial(page_number, pseudo_bbox, spans)
 
         width: int | None = None
         height: int | None = None

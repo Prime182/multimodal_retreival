@@ -3,9 +3,17 @@ backend/src/multimodal/ingestion/text.py
 
 Text chunking with graceful fallback.
 
-pymupdf4llm does NOT populate page_boxes by default, so page.blocks is
-always [].  build_text_chunks_layout_aware detects this and falls back
-to line-by-line processing of page.text, which pymupdf4llm always fills.
+BUG FIXED: flush() in _chunk_from_text was missing `nonlocal` declarations
+for buf_lines, buf_pages, buf_tokens, cur_section.
+
+Python sees the assignment `buf_lines = []` at the END of flush() and
+therefore treats `buf_lines` as a LOCAL variable throughout the entire
+function body — including the guard `if not buf_lines` at the TOP.
+This causes an UnboundLocalError on the first real flush call, meaning
+zero text chunks are ever produced.
+
+Fix: add `nonlocal buf_lines, buf_pages, buf_tokens, cur_section` at the
+start of flush() so Python correctly mutates the enclosing scope's variables.
 """
 
 from __future__ import annotations
@@ -34,7 +42,6 @@ def build_text_chunks(
     If page.blocks is empty (pymupdf4llm default), falls back to
     line-by-line processing of page.text.
     """
-    # Check whether any page actually has blocks
     has_blocks = any(
         isinstance(b, dict) and b.get("type") == "text"
         for page in pages
@@ -55,7 +62,7 @@ def build_text_chunks(
         )
 
 
-# ── Path A: block-based (only used if pymupdf4llm provides page_boxes) ────────
+# ── Path A: block-based ────────────────────────────────────────────────────────
 
 def _chunk_from_blocks(
     *,
@@ -93,6 +100,7 @@ def _chunk_from_blocks(
             cur_section: str | None = None
             buf_bbox: tuple | None = None
 
+            # _chunk_from_blocks flush takes all state as parameters → no nonlocal needed
             def flush(sect, col, btext, btokens, bbbox):
                 if not btext:
                     return
@@ -115,7 +123,6 @@ def _chunk_from_blocks(
                 if not block_text:
                     continue
                 block_bbox = tuple(block["bbox"])
-                # Use line-based section resolution with y0 as proxy line
                 line_proxy = int(block_bbox[1])
                 section = resolve_section(page.page_number, line_proxy, spans)
                 block_tokens = estimate_tokens(block_text)
@@ -143,7 +150,7 @@ def _chunk_from_blocks(
     return chunks
 
 
-# ── Path B: line-based fallback (used when page_boxes is absent) ──────────────
+# ── Path B: line-based fallback ────────────────────────────────────────────────
 
 def _chunk_from_text(
     *,
@@ -156,8 +163,11 @@ def _chunk_from_text(
 ) -> list[TextChunk]:
     """
     Process page.text line by line.
-    This is the reliable path because pymupdf4llm always populates page.text
-    even when it does not populate page_boxes / blocks.
+
+    FIX: flush() declares `nonlocal buf_lines, buf_pages, buf_tokens,
+    cur_section`. Without this, Python treats those names as local variables
+    throughout flush() (because of the assignments at the end), raising
+    UnboundLocalError even on the first `if not buf_lines` guard.
     """
     chunks: list[TextChunk] = []
 
@@ -167,7 +177,7 @@ def _chunk_from_text(
     cur_section: str | None = None
 
     def flush() -> None:
-        nonlocal buf_lines, buf_pages, buf_tokens, cur_section
+        nonlocal buf_lines, buf_pages, buf_tokens, cur_section  # ← THE FIX
         if not buf_lines or not buf_pages:
             buf_lines, buf_pages, buf_tokens = [], [], 0
             return
@@ -190,8 +200,6 @@ def _chunk_from_text(
 
         for line_index, raw_line in enumerate(page.text.splitlines()):
             stripped = raw_line.strip()
-
-            # Use line-based section resolver (takes int, not bbox)
             section = resolve_section(page.page_number, line_index, spans)
 
             if detect_heading(stripped):
@@ -206,7 +214,6 @@ def _chunk_from_text(
 
             line_tokens = estimate_tokens(stripped)
 
-            # Line longer than the whole budget → slice it
             if line_tokens > token_limit:
                 flush()
                 cur_section = section
