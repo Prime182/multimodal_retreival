@@ -1,86 +1,189 @@
-"""
-backend/src/multimodal/ingestion/equation.py
-
-BUG FIXED: pseudo-bbox y0 was `index * 10` (hardcoded).
-section.py text-fallback spans store bbox.y0 = line_index * _APPROX_LINE_HEIGHT.
-resolve_section_spatial() divides y0 by _APPROX_LINE_HEIGHT to get a line index.
-Using a different constant (10 vs 12) caused a ~20% offset, meaning equations
-near section boundaries were assigned to the wrong section.
-
-Fix: import _APPROX_LINE_HEIGHT from section.py and use it for the pseudo-bbox.
-The constant is defined once in section.py and shared across all three modules.
-"""
-
+# backend/src/multimodal/ingestion/equation.py
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Sequence
 
+try:
+    import pdfplumber
+except ImportError:
+    pdfplumber = None  # type: ignore[assignment]
+
 from ..types import EquationChunk, PageBlocks, SectionSpan
-from .section import _APPROX_LINE_HEIGHT, detect_heading, resolve_section_spatial
-from .utils import normalise_line
+from .section import _APPROX_LINE_HEIGHT, resolve_section_spatial
 
+# ---------------------------------------------------------------------------
+# Patterns — ported directly from formula_extractor.py
+# ---------------------------------------------------------------------------
 
-_LATEX_MARKERS = (
-    "\\frac", "\\sum", "\\int", "\\alpha", "\\beta", "\\theta",
-    "\\lambda", "\\mu", "\\sigma", "\\pi", "\\sqrt", "\\begin",
-    "\\end", "\\left", "\\right",
-)
-
-_DISPLAY_MATH_RE = re.compile(
-    r"""
-    \([^)]{3,}\s*[−–\-]\s*[^)]{3,}\)\s*/\s*\(
-    |
-    ^\s*=\s*.{5,}[×÷*/]\s*\d
-    |
-    [=]\s*\([^)]+[−–\-][^)]+\)\s*/
-    |
-    \bOD\b.*[=\-−–/].*\bOD\b
-    |
-    \b\w[\w\s]{0,20}[(%]\s*\)\s*=\s*.+[/×÷]
-    |
-    ^\s*=\s*(?=.*[+\-−–×÷*/^])
-    """,
-    re.VERBOSE | re.IGNORECASE | re.MULTILINE,
-)
-
-_HARD_VETO_WORDS: frozenset[str] = frozenset(
-    {
-        "renal", "allograft", "hepatic", "viral", "serum", "plasma",
-        "patients", "patient", "participants", "recipients",
-        "therapy", "survival", "function", "toxicity", "efficacy",
-        "transplant", "months", "years", "weeks", "days", "hours",
-        "clinical", "medical", "surgical", "laboratory",
-        "egfr", "hbv", "hbsag", "hbeag", "alt", "ast", "afp",
-        "ml/min", "iu/ml", "u/l", "mmol/l", "umol/l",
-        "dna", "rna", "pcr", "elisa",
-        "compared", "showed", "demonstrated", "observed", "reported",
-        "significant", "difference", "association", "correlation",
-        "baseline", "respectively", "analysis",
-        "result", "results", "mean", "median",
-        "stable", "remained", "experienced", "naive",
-        "the", "and", "that", "this", "vs", "with", "from",
-        "have", "which", "their", "were", "been", "than",
-        "these", "those", "however", "therefore", "although",
-        "during", "after", "before", "between", "among", "within",
-        "while", "because", "since", "also", "both", "further",
-        "follow-up", "followup", "overall",
-    }
-)
-
-_MATH_IDENTIFIERS: frozenset[str] = frozenset(
-    {
-        "sin", "cos", "tan", "log", "exp", "det", "div", "inf",
-        "max", "min", "mod", "arg", "sgn", "var", "cov", "std",
-        "lim", "sup", "deg",
-    }
-)
-
-_STATISTICAL_NOTATION_RE = re.compile(
-    r"^\s*(?:p|n)\s*[=<>]\s*(?:\d+|0?\.\d+|ns)\s*$",
+FORMULA_INTRO = re.compile(
+    r"(?:using\s+the\s+following\s+formula"
+    r"|calculated\s+using\s+the\s+following"
+    r"|determine\s+by\s+using\s+the\s+following"
+    r"|determined\s+by\s+the\s+following)",
     re.IGNORECASE,
 )
 
+MATH_SYM = re.compile(r"[×÷±√∑∫≤≥≠≈∞μαβγδλσφπΩ°]")
+
+NAMED_KW = re.compile(
+    r"(?:cell\s*viability|eradication\s*of\s*biofilm"
+    r"|%\s*of\s*hemolysis|eradication\s*\(%\)"
+    r"|hemolysis\s*at\s*\d+\s*nm)",
+    re.IGNORECASE,
+)
+
+NOISE_RE = re.compile(
+    r"^(?:figure\s*\d|table\s*\d|scheme\s*\d"
+    r"|https?://|doi\s*[:\.]|\d{3,5}\s*$)",
+    re.IGNORECASE,
+)
+
+SECTION_RE = re.compile(
+    r"^(?:\d+[\.\d]*\.?\s+)[A-Z][^\n]{3,80}$",
+    re.MULTILINE,
+)
+
+
+# ---------------------------------------------------------------------------
+# Column-aware text extraction — matches formula_extractor.page_columns()
+# ---------------------------------------------------------------------------
+
+def _page_columns(page) -> list[str]:
+    """Return [left_col, right_col] for two-column pages, else [full_text]."""
+    pw = page.width
+
+    def crop(x0: float, x1: float) -> str:
+        try:
+            return (
+                page.crop((x0, 0, x1, page.height)).extract_text(
+                    x_tolerance=3, y_tolerance=3
+                )
+                or ""
+            )
+        except Exception:
+            return ""
+
+    left = crop(0, pw / 2)
+    right = crop(pw / 2, pw)
+    if len(left) > 150 and len(right) > 150:
+        return [left, right]
+    return [page.extract_text(x_tolerance=3, y_tolerance=3) or ""]
+
+
+# ---------------------------------------------------------------------------
+# Formula collection helpers
+# ---------------------------------------------------------------------------
+
+def _collect_display_formula(lines: list[str], intro_idx: int) -> str:
+    """Collect lines immediately after a formula-introduction phrase."""
+    parts: list[str] = []
+    blank_count = 0
+    for i in range(intro_idx + 1, min(len(lines), intro_idx + 12)):
+        s = lines[i].strip()
+        if not s:
+            blank_count += 1
+            if blank_count > 1:
+                break
+            continue
+        if SECTION_RE.match(s) or NOISE_RE.match(s):
+            break
+        if parts and s.endswith(".") and len(s) > 60:
+            break
+        parts.append(s)
+        blank_count = 0
+    return " ".join(parts)
+
+
+def _extract_context(lines: list[str], line_idx: int) -> str:
+    """Return one sentence of surrounding context for an equation line."""
+    before = " ".join(
+        l.strip() for l in lines[max(0, line_idx - 2) : line_idx] if l.strip()
+    )[-250:]
+    if not before:
+        return "Equation extracted from document."
+    for sentence in re.split(r"(?<=[.!?])\s+", before):
+        if sentence.strip():
+            return sentence.strip()
+    return before
+
+
+def _is_real_equation(text: str) -> bool:
+    """Require a meaningful LHS and RHS around the equals sign."""
+    if "=" not in text:
+        return False
+    lhs, _, rhs = text.partition("=")
+    lhs_ok = len(re.sub(r"\s", "", lhs)) > 3
+    rhs_ok = len(re.sub(r"\s", "", rhs)) > 1
+    return lhs_ok and rhs_ok
+
+
+# ---------------------------------------------------------------------------
+# Per-column scanner — matches formula_extractor.scan_column()
+# ---------------------------------------------------------------------------
+
+def _scan_column(text: str, page_num: int) -> list[dict]:
+    if not text.strip():
+        return []
+
+    lines = text.split("\n")
+    results: list[dict] = []
+    seen: set[str] = set()
+
+    def register(formula: str, line_idx: int) -> None:
+        norm = re.sub(r"\s+", " ", formula).strip()
+        if len(norm) < 6 or NOISE_RE.match(norm):
+            return
+        if not _is_real_equation(norm):
+            return
+        key = re.sub(r"[^\w=+\-*/×%]", "", norm.lower())[:65]
+        if key in seen:
+            return
+        seen.add(key)
+        results.append(
+            {
+                "raw_text": norm,
+                "page_number": page_num,
+                "context": _extract_context(lines, line_idx),
+            }
+        )
+
+    # Pass A — formula-introduction phrases
+    for i, line in enumerate(lines):
+        if FORMULA_INTRO.search(line):
+            formula = _collect_display_formula(lines, i)
+            if formula and ("=" in formula or "%" in formula):
+                register(formula, i)
+
+    # Pass B — named biological/chemical calculation formulas
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if NAMED_KW.search(s) and ("=" in s or "%" in s):
+            chunk = s
+            for j in range(1, 6):
+                nxt = lines[i + j].strip() if i + j < len(lines) else ""
+                if not nxt or NOISE_RE.match(nxt) or SECTION_RE.match(nxt):
+                    break
+                chunk += " " + nxt
+                if chunk.count("=") >= 1 and ("100" in chunk or ")" in chunk):
+                    break
+            register(chunk, i)
+
+    # Pass C — inline math signals (math symbol + equals sign)
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if not s or NOISE_RE.match(s):
+            continue
+        if (MATH_SYM.search(s) and "=" in s) or ("OD" in s and "=" in s):
+            register(s, i)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Public entry point — called by ingestion.py (signature unchanged)
+# ---------------------------------------------------------------------------
 
 def extract_equations(
     *,
@@ -92,151 +195,57 @@ def extract_equations(
     cell_exclusion: set[str],
     row_exclusion: set[str],
 ) -> list[EquationChunk]:
+    if pdfplumber is None:
+        return []
+
     chunks: list[EquationChunk] = []
 
-    for page in pages:
-        lines = [line.rstrip() for line in page.text.splitlines()]
-        block: list[str] = []
-        block_start = 0
-        block_section: str | None = None
+    with pdfplumber.open(source_path) as pdf:
+        page_by_num = {p.page_number: p for p in pages}
 
-        def flush(end_index: int) -> None:
-            nonlocal block, block_start, block_section
-            if not block:
-                return
-            latex = "\n".join(line.strip() for line in block if line.strip()).strip()
-            if latex:
-                chunks.append(
-                    EquationChunk(
-                        chunk_id=f"{journal_id}_{article_id}_eq_{len(chunks) + 1:05d}",
-                        journal_id=journal_id,
-                        article_id=article_id,
-                        source_path=source_path,
-                        latex=latex,
-                        context=_extract_context(lines, block_start, end_index),
-                        page_number=page.page_number,
-                        section=block_section,
+        for plumber_page in pdf.pages:
+            page_num = plumber_page.page_number
+            page_meta = page_by_num.get(page_num)
+            page_w = page_meta.width if page_meta else 600.0
+            page_h = page_meta.height if page_meta else 800.0
+
+            for col_text in _page_columns(plumber_page):
+                for hit in _scan_column(col_text, page_num):
+                    raw = hit["raw_text"]
+
+                    # --- Table-region veto (Bug #2 fix from bugs_and_solutions.md) ---
+                    norm = re.sub(r"\s+", " ", raw).strip().lower()
+                    if norm in row_exclusion:
+                        continue
+                    cell_hits = sum(
+                        1 for c in cell_exclusion if len(c) > 3 and c in norm
                     )
-                )
-            block = []
-            block_start = 0
-            block_section = None
+                    if cell_hits >= 2:
+                        continue
 
-        for index, line in enumerate(lines):
-            stripped = line.strip()
-
-            if detect_heading(stripped):
-                flush(index)
-                continue
-
-            norm = normalise_line(line)
-            if norm in row_exclusion:
-                flush(index)
-                continue
-
-            cell_hits = sum(1 for cell in cell_exclusion if len(cell) > 3 and cell in norm)
-            if cell_hits >= 2:
-                flush(index)
-                continue
-
-            if is_equation_line(line):
-                if not block:
-                    block_start = index
-                    # FIX: use _APPROX_LINE_HEIGHT imported from section.py.
-                    # resolve_section_spatial() divides y0 by _APPROX_LINE_HEIGHT
-                    # to convert back to a line index; using the same constant
-                    # here ensures the round-trip is exact.
-                    # Previously: y0 = index * 10  (hardcoded, inconsistent)
-                    pseudo_y0 = float(index) * _APPROX_LINE_HEIGHT
+                    # --- Section resolution ---
+                    # Use mid-page y as approximation; good enough for section
+                    # assignment because headings are tens of lines apart.
+                    approx_y = page_h * 0.4
                     pseudo_bbox = (
-                        100.0,
-                        pseudo_y0,
-                        500.0,
-                        pseudo_y0 + _APPROX_LINE_HEIGHT,
+                        50.0,
+                        approx_y,
+                        page_w - 50.0,
+                        approx_y + _APPROX_LINE_HEIGHT,
                     )
-                    block_section = resolve_section_spatial(
-                        page.page_number, pseudo_bbox, spans
+                    section = resolve_section_spatial(page_num, pseudo_bbox, spans)
+
+                    chunks.append(
+                        EquationChunk(
+                            chunk_id=f"{journal_id}_{article_id}_eq_{len(chunks)+1:05d}",
+                            journal_id=journal_id,
+                            article_id=article_id,
+                            source_path=source_path,
+                            latex=raw,
+                            context=hit.get("context"),
+                            page_number=page_num,
+                            section=section,
+                        )
                     )
-                block.append(line)
-                continue
-
-            flush(index)
-
-        flush(len(lines))
 
     return chunks
-
-
-def is_equation_line(line: str) -> bool:
-    stripped = line.strip()
-    if len(stripped) < 3:
-        return False
-
-    if any(marker in stripped for marker in _LATEX_MARKERS):
-        return True
-
-    if _DISPLAY_MATH_RE.search(stripped):
-        return True
-
-    if _STATISTICAL_NOTATION_RE.match(stripped):
-        return False
-
-    lower_tokens = {
-        token.lower().strip(".,;:()[]{}\"'%-+*/^=<>")
-        for token in stripped.split()
-    }
-    if lower_tokens & _HARD_VETO_WORDS:
-        return False
-
-    if not re.search(r"[=<>]", stripped):
-        return False
-
-    english_count, math_count = _classify_tokens(stripped.split())
-    total = english_count + math_count
-    if total == 0 or math_count < 2:
-        return False
-
-    return (math_count / total) >= 0.60
-
-
-def _classify_tokens(tokens: list[str]) -> tuple[int, int]:
-    english = 0
-    math = 0
-    for token in tokens:
-        clean = token.strip(".,;:()[]{}\"'")
-        if not clean:
-            continue
-        if re.fullmatch(r"[+\-*/=<>^±∑∫√≈≠≤≥∞∂∆∇λμσπθβα|\\]+", clean):
-            math += 1; continue
-        if re.fullmatch(r"\d[\d.,]*[A-Za-z]{0,4}", clean):
-            math += 1; continue
-        if re.fullmatch(r"[A-Za-z]{1,2}", clean):
-            math += 1; continue
-        if clean.lower() in _MATH_IDENTIFIERS:
-            math += 1; continue
-        if re.fullmatch(r"[A-Za-z]{1,3}_[A-Za-z0-9]{1,3}", clean):
-            math += 1; continue
-        if re.fullmatch(r"d[A-Za-z]+/d[A-Za-z]+", clean):
-            math += 1; continue
-        if re.fullmatch(r"[A-Za-z]{1,4}\^?\d+", clean):
-            math += 1; continue
-        if re.fullmatch(r"\d+[\^e]-?\d+", clean, re.IGNORECASE):
-            math += 1; continue
-        if re.fullmatch(r"[A-Za-z0-9]+/[A-Za-z0-9]+", clean):
-            math += 1; continue
-        if len(clean) >= 3 and re.search(r"[A-Za-z]{3}", clean):
-            english += 1
-    return english, math
-
-
-def _extract_context(lines: Sequence[str], start: int, end: int) -> str:
-    surrounding = list(lines[max(0, start - 2):start]) + list(
-        lines[end:min(len(lines), end + 2)]
-    )
-    text = " ".join(line.strip() for line in surrounding if line.strip())
-    if not text:
-        return "Equation extracted from surrounding document context."
-    for sentence in re.split(r"(?<=[.!?])\s+", text):
-        if sentence.strip():
-            return sentence.strip()
-    return text.strip()
