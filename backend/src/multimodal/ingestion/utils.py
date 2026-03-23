@@ -1,21 +1,10 @@
 # backend/src/multimodal/ingestion/utils.py
-"""
-Phase 1 IMPLEMENTATION: Pdfplumber-native text extraction pipeline.
-
-REMOVED: pymupdf, pymupdf4llm, clean_page_text(), _pdfplumber_page_text()
-
-NEW: Native pdfplumber column-aware text extraction supporting two-column
-academic PDFs without external markdown conversion.
-
-This replaces pymupdf4llm completely, which is the root cause of text_chunks=0
-for two-column layouts (Bug #1 from BUGS_AND_SOLUTIONS.md).
-"""
-
 from __future__ import annotations
 
 import json
 import re
 import shutil
+import statistics
 import subprocess
 from collections import defaultdict
 from pathlib import Path
@@ -143,29 +132,26 @@ def detect_column_split(page) -> float | None:
 
 def extract_page_text(page, body_size: float, column_aware: bool = True) -> str:
     """
-    Extract text from a single pdfplumber page,
-    handling two-column layouts if column_aware=True.
-
-    Returns text with columns concatenated (left then right).
+    Extract text from a single pdfplumber page using crop+extract_text,
+    which correctly handles word spacing from PDF glyph metrics.
     """
     if column_aware:
         gutter = detect_column_split(page)
         if gutter is not None:
-            # Split chars into left and right columns
-            left_chars = [c for c in page.chars if c["x0"] < gutter]
-            right_chars = [c for c in page.chars if c["x0"] >= gutter]
+            try:
+                left_text = (
+                    page.crop((0, 0, gutter, page.height))
+                    .extract_text(x_tolerance=3, y_tolerance=3) or ""
+                )
+                right_text = (
+                    page.crop((gutter, 0, page.width, page.height))
+                    .extract_text(x_tolerance=3, y_tolerance=3) or ""
+                )
+            except Exception:
+                left_text = right_text = ""
+            return f"{left_text}\n\n{right_text}"
 
-            # Extract text from each column independently
-            left_text = _extract_text_from_chars(left_chars)
-            right_text = _extract_text_from_chars(right_chars)
-
-            # Interleave by y-position to maintain reading order as much as possible
-            text = f"{left_text}\n\n{right_text}"
-            return text
-
-    # Single-column or fallback
-    text = _extract_text_from_chars(page.chars)
-    return text
+    return page.extract_text(x_tolerance=3, y_tolerance=3) or ""
 
 
 def _extract_text_from_chars(chars: list[dict]) -> str:
