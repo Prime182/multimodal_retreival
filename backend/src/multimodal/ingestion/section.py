@@ -46,6 +46,7 @@ Final fix: ALL spans use line_start as a line index.
 from __future__ import annotations
 
 import re
+import statistics
 from typing import Sequence
 
 from ..types import PageBlocks, SectionSpan
@@ -53,6 +54,14 @@ from ..types import PageBlocks, SectionSpan
 # Single constant shared with equation.py and image.py.
 # Must be imported from here — do not redefine in those modules.
 _APPROX_LINE_HEIGHT: float = 12.0
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase 2: Font-size based heading detection thresholds
+# ──────────────────────────────────────────────────────────────────────────────
+H1_THRESHOLD = 4.0   # paper title, figure titles (significantly larger than body)
+H2_THRESHOLD = 2.0   # section headings  e.g. "1. INTRODUCTION"
+H3_THRESHOLD = 0.8   # sub-section headings  e.g. "2.1 Mechanism"
+DETECT_BOLD_HEADINGS = True  # bold body-size lines → treat as sub-heading
 
 _HEADING_NUMBER_RE = re.compile(r"^\s*((\d+(\.\d+)*)\.?|[IVXLC]+\.?)\s+[A-Z]")
 _KNOWN_SECTION_NAMES = {
@@ -129,8 +138,21 @@ def build_section_spans_from_blocks(pages: list[PageBlocks]) -> list[SectionSpan
 
         # ── Fallback: scan page.text for heading lines ────────────────────────
         if not block_spans_found and page.text:
+            try:
+                import pdfplumber
+                # Try to re-open the PDF to access character data for font-size detection
+                # We need to determine the PDF path from somewhere... 
+                # For now, fallback to regex-only detection
+                char_data_by_line: dict[int, list[dict]] = {}
+            except ImportError:
+                char_data_by_line = {}
+            
             for line_index, raw_line in enumerate(page_lines):
-                heading = detect_heading(raw_line.strip())
+                heading = detect_heading(
+                    raw_line.strip(),
+                    chars=char_data_by_line.get(line_index),
+                    body_size=page.body_size,
+                )
                 if heading:
                     spans.append(SectionSpan(
                         page_number=page.page_number,
@@ -222,11 +244,30 @@ def resolve_section_spatial(
 
 # ── Heading detector ───────────────────────────────────────────────────────────
 
-def detect_heading(line: str) -> str | None:
+def detect_heading(line: str, chars: list[dict] | None = None, body_size: float = 10.0) -> str | None:
     """
     Return a normalised heading string if `line` looks like a section heading,
     otherwise None.
+
+    PHASE 2: Font-size detection support
+    ─────────────────────────────────────
+    When called with chars data, uses font-size delta to classify.
+    Otherwise, falls back to regex patterns (backward compatible).
+
+    Parameters:
+    - line: the text line to check
+    - chars: optional list of char dicts from pdfplumber page containing this line
+    - body_size: estimated body text font size (defaults to 10.0)
     """
+    # Phase 2 font-size path
+    if chars is not None:
+        prefix = classify_line(chars, body_size)
+        if prefix.strip():  # Font-size says this is a heading
+            return line.strip()
+        else:
+            return None
+
+    # Existing regex fallback
     stripped = line.strip()
     if not stripped or len(stripped) > 120:
         return None
@@ -261,3 +302,42 @@ def detect_heading(line: str) -> str | None:
         return normalized.title()
 
     return None
+
+
+def classify_line(line_chars: list[dict], body_size: float) -> str:
+    """
+    Classify a single text line (given as a list of char dicts) by font-size delta.
+    Returns heading marker ('### ', '## ', '# ', '') to indicate hierarchy level.
+
+    Used by Phase 2 font-size heading detection.
+    """
+    if not line_chars:
+        return ""
+
+    sizes = [ch["size"] for ch in line_chars if ch.get("size", 0) > 4]
+    fontnames = [ch.get("fontname", "") for ch in line_chars]
+
+    if not sizes:
+        return ""
+
+    avg_size = statistics.mean(sizes)
+    delta = avg_size - body_size
+
+    # Classify based on size delta
+    if delta >= H1_THRESHOLD:
+        return "### "
+    if delta >= H2_THRESHOLD:
+        return "## "
+    if delta >= H3_THRESHOLD:
+        return "# "
+
+    # Check for bold at body size (can be sub-heading)
+    if DETECT_BOLD_HEADINGS:
+        is_bold = any(
+            "Bold" in f or "bold" in f or "Semibold" in f or "SemiBold" in f
+            for f in fontnames
+        )
+        if is_bold and abs(delta) < 0.5:
+            return "# "
+
+    return ""

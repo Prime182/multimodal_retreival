@@ -35,6 +35,7 @@ class PageBlocks:
     blocks: list[dict[str, Any]]
     width: float
     height: float
+    body_size: float = 10.0  # Estimated body text font size in points
 
 
 @dataclass(slots=True, frozen=True)
@@ -119,9 +120,31 @@ class TableChunk:
 
     @property
     def embed_text(self) -> str:
-        col_hint = f"Column {self.column + 1}" if self.column is not None else None
-        parts = [self.section, col_hint, self.caption, self.header, self.csv_data]
-        return "\n\n".join(part for part in parts if part)
+        # Phase 5: Caption bookending — repeating at both ends gives it disproportionate weight
+        # without needing changes to the embedding model call
+        parts = []
+        
+        # Caption first (anchor)
+        if self.caption:
+            parts.append(self.caption)
+        
+        # Section and metadata
+        if self.section:
+            parts.append(f"Section: {self.section}")
+        if self.column is not None:
+            parts.append(f"Column {self.column + 1}")
+        
+        # Table header and data
+        if self.header:
+            parts.append(self.header)
+        if self.csv_data:
+            parts.append(self.csv_data)
+        
+        # Caption last (bookend)
+        if self.caption:
+            parts.append(self.caption)
+        
+        return "\n\n".join(parts)
 
     def metadata(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -143,7 +166,20 @@ class ExtractedImage:
     caption: str | None = None
     image_url: str | None = None
     section: str | None = None
+    context: str | None = None  # Phase 6: body text context before figure
     content_type: ContentType = "image"
+
+    @property
+    def embed_text(self) -> str:
+        """Phase 6: Richer text signal for image embedding with context."""
+        parts = []
+        if self.caption:
+            parts.append(self.caption)
+        if self.section:
+            parts.append(f"Section: {self.section}")
+        if self.context:
+            parts.append(self.context)
+        return "\n\n".join(parts)
 
     def metadata(self) -> dict[str, Any]:
         payload = asdict(self)

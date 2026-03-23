@@ -69,10 +69,20 @@ class MultimodalRetrievalService:
             images_to_store: list[ExtractedImage] = []
             for image in document.images:
                 try:
-                    embedding = self.embedding_client.embed_file(image.file_path)
-                    if image.caption:
-                        caption_embedding = self.embedding_client.embed_text(image.caption)
-                        embedding = _blend_embeddings(embedding, caption_embedding)
+                    visual_embedding = self.embedding_client.embed_file(image.file_path)
+
+                    # Phase 6: Use richer text signal (caption + section + context)
+                    if image.embed_text.strip():
+                        text_embedding = self.embedding_client.embed_text(image.embed_text)
+                        embedding = _blend_embeddings(
+                            visual_embedding,
+                            text_embedding,
+                            image_weight=0.55,      # was 0.70 
+                            caption_weight=0.45,    # was 0.30 — richer text earns more weight
+                        )
+                    else:
+                        embedding = visual_embedding
+
                 except Exception as exc:
                     print(f"[WARN] Could not embed image {image.file_path}: {exc}")
                     continue

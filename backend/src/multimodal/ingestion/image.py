@@ -23,6 +23,11 @@ try:
 except Exception:  # pragma: no cover - Pillow is optional for metadata only.
     Image = None
 
+try:
+    import pdfplumber
+except ImportError:
+    pdfplumber = None
+
 from ..types import ExtractedImage, PageBlocks
 from .section import SectionSpan, _APPROX_LINE_HEIGHT, resolve_section_spatial
 from .utils import require_command, run_command
@@ -78,6 +83,7 @@ def extract_images(
         page_number = _infer_page_number(path.name)
         section: str | None = None
         caption: str | None = None
+        context: str | None = None
 
         if page_number is not None:
             page_obj = page_by_num.get(page_number)
@@ -85,14 +91,23 @@ def extract_images(
             page_width = page_obj.width if page_obj else 600.0
             page_height = page_obj.height if page_obj else 800.0
 
-            caption_line_index = _find_caption_line(image_index, lines_on_page)
-            caption = _extract_figure_caption(caption_line_index, lines_on_page)
+            # Phase 6: Try pdfplumber-based extraction first (multi-sentence captions + context)
+            caption, context = _extract_figure_caption_pdfplumber(
+                str(pdf_path), page_number, image_index
+            )
+
+            # Fallback to line-scan if pdfplumber found nothing
+            if caption is None:
+                caption_line_index = _find_caption_line(image_index, lines_on_page)
+                caption = _extract_figure_caption(caption_line_index, lines_on_page)
+                context = None
 
             # FIX: use _APPROX_LINE_HEIGHT (imported from section.py) instead
             # of the previously hardcoded 10.0.
             # resolve_section_spatial() converts y0 via int(y0/_APPROX_LINE_HEIGHT)
             # to compare against span.line_start (a line index). Using the same
             # constant here ensures the round-trip is exact.
+            caption_line_index = _find_caption_line(image_index, lines_on_page)
             pseudo_y0 = float(caption_line_index) * _APPROX_LINE_HEIGHT
             pseudo_y0 = max(0.0, min(pseudo_y0, page_height - _APPROX_LINE_HEIGHT))
             pseudo_bbox = (
@@ -125,6 +140,7 @@ def extract_images(
                 height=height,
                 caption=caption or _build_image_caption(page_number, section),
                 section=section,
+                context=context,  # Phase 6: Pass context
             )
         )
 
@@ -147,6 +163,94 @@ def _infer_page_number(file_name: str) -> int | None:
     if len(numbers) >= 2:
         return numbers[-2]
     return numbers[0]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase 6: Enhanced caption and context extraction using pdfplumber
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _extract_figure_caption_pdfplumber(
+    pdf_path: str,
+    page_number: int,
+    image_index: int,
+) -> tuple[str | None, str | None]:
+    """
+    Extract (caption, context) using pdfplumber word stream.
+
+    Returns:
+        (caption, context) tuple where:
+        - caption: full figure caption, multi-sentence, ends at natural boundary
+        - context: up to 2 sentences of body text immediately before the figure
+    """
+    if pdfplumber is None:
+        return None, None
+
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            if not (0 < page_number <= len(pdf.pages)):
+                return None, None
+            page = pdf.pages[page_number - 1]
+            words = page.extract_words(x_tolerance=3, y_tolerance=3)
+    except Exception:
+        return None, None
+
+    if not words:
+        return None, None
+
+    # Group words into lines by y-coordinate proximity
+    lines: list[list[dict]] = []
+    for word in sorted(words, key=lambda w: (round(w["top"] / 3) * 3, w["x0"])):
+        if lines and abs(word["top"] - lines[-1][0]["top"]) <= 4:
+            lines[-1].append(word)
+        else:
+            lines.append([word])
+
+    line_texts = [" ".join(w["text"] for w in ln) for ln in lines]
+
+    # Find caption start by matching "Figure N" or "Fig. N"
+    fig_exact = re.compile(
+        rf"\b(?:figure|fig\.?)\s*{image_index}\b", re.IGNORECASE
+    )
+    fig_any = re.compile(r"^\s*(?:figure|fig\.?)\s*\d+", re.IGNORECASE)
+
+    caption_start = next(
+        (i for i, t in enumerate(line_texts) if fig_exact.search(t)), -1
+    )
+    if caption_start == -1:
+        caption_start = next(
+            (i for i, t in enumerate(line_texts) if fig_any.search(t)), -1
+        )
+    if caption_start == -1:
+        return None, None
+
+    # Collect caption lines
+    caption_parts = [line_texts[caption_start]]
+    for i in range(caption_start + 1, min(len(line_texts), caption_start + 12)):
+        text = line_texts[i].strip()
+        if not text:
+            break
+        if re.match(r"^\s*(?:figure|fig\.?|table|scheme)\s*\d+", text, re.IGNORECASE):
+            break
+        if text.isupper() and len(text.split()) <= 5:  # section heading
+            break
+        if re.match(r"^\d+[\.\s]", text):  # numbered section
+            break
+        caption_parts.append(text)
+        if text.endswith("."):
+            break
+
+    caption = " ".join(caption_parts).strip() or None
+
+    # Collect context: 2 sentences before the caption
+    raw_context = " ".join(
+        ln.strip()
+        for ln in line_texts[max(0, caption_start - 6) : caption_start]
+        if ln.strip()
+    )
+    sentences = re.split(r"(?<=[.!?])\s+", raw_context)
+    context = " ".join(sentences[-2:]).strip() if sentences else None
+
+    return caption, context
 
 
 def _find_caption_line(image_index: int, page_lines: Sequence[str]) -> int:

@@ -1,8 +1,0 @@
-Requirement already satisfied: pdfplumber in ./.venv/lib/python3.12/site-packages (0.11.9)
-Requirement already satisfied: pdfminer.six==20251230 in ./.venv/lib/python3.12/site-packages (from pdfplumber) (20251230)
-Requirement already satisfied: Pillow>=9.1 in ./.venv/lib/python3.12/site-packages (from pdfplumber) (12.1.1)
-Requirement already satisfied: pypdfium2>=4.18.0 in ./.venv/lib/python3.12/site-packages (from pdfplumber) (5.6.0)
-Requirement already satisfied: charset-normalizer>=2.0.0 in ./.venv/lib/python3.12/site-packages (from pdfminer.six==20251230->pdfplumber) (3.4.6)
-Requirement already satisfied: cryptography>=36.0.0 in ./.venv/lib/python3.12/site-packages (from pdfminer.six==20251230->pdfplumber) (46.0.5)
-Requirement already satisfied: cffi>=2.0.0 in ./.venv/lib/python3.12/site-packages (from cryptography>=36.0.0->pdfminer.six==20251230->pdfplumber) (2.0.0)
-Requirement already satisfied: pycparser in ./.venv/lib/python3.12/site-packages (from cffi>=2.0.0->cryptography>=36.0.0->pdfminer.six==20251230->pdfplumber) (3.0)
