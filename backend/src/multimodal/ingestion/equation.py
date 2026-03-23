@@ -45,9 +45,138 @@ SECTION_RE = re.compile(
     re.MULTILINE,
 )
 
+# ---------------------------------------------------------------------------
+# Post-processing: clean_pdf_text  (ported from formula_extractor.py)
+# ---------------------------------------------------------------------------
+
+KNOWN_PAIRS = [
+    ('treatedcells',          'treated cells'),
+    ('untreatedcells',        'untreated cells'),
+    ('cellviability',         'Cell viability'),
+    ('eradicationofbiofilm',  'Eradication of biofilm'),
+    ('odinsample',            'OD in sample'),
+    ('odincontrol',           'OD in control'),
+    ('odintreatment',         'OD in treatment'),
+    ('odofsample',            'OD of sample'),
+    ('odof',                  'OD of '),
+    ('vecontrol',             've control'),
+    ('ofhemolysisat',         'of hemolysis at '),
+    ('%ofhemolysis',          '% of hemolysis'),
+    ('standarddeviation',     'standard deviation'),
+    ('shownhereasthe',        'shown here as the'),
+    ('valuesare',             'values are'),
+    ('areshownhere',          'are shown here'),
+]
+
+CAMEL_RE = re.compile(r'(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])')
+
+STATS_ONLY = re.compile(
+    r'^(?:(?:values?\s*)?(?:are\s+)?shown\s+here\s+as\s+the\s+means?'
+    r'|means?\s*[±\+]\s*standard\s+deviation'
+    r'|\(n\s*=\s*\d+\))',
+    re.IGNORECASE,
+)
+
+
+def clean_pdf_text(text: str) -> str:
+    """Fix common PDF text extraction artefacts in equation strings."""
+    s = text
+    for run, spaced in KNOWN_PAIRS:
+        s = re.sub(re.escape(run), spaced, s, flags=re.IGNORECASE)
+    s = CAMEL_RE.sub(' ', s)
+    s = re.sub(r'  +', ' ', s).strip()
+    return s
+
+
+def _is_real_equation_post(text: str) -> bool:
+    """Post-processing quality check: reject stat annotations and trivial strings."""
+    if STATS_ONLY.match(text.strip()):
+        return False
+    if text.strip() in ('= × 100', '= ×100', '='):
+        return False
+    if '=' not in text:
+        return False
+    lhs, _, rhs = text.partition('=')
+    lhs_ok = len(re.sub(r'\s', '', lhs)) > 3
+    rhs_ok = len(re.sub(r'\s', '', rhs)) > 1
+    return lhs_ok and rhs_ok
+
 
 # ---------------------------------------------------------------------------
-# Column-aware text extraction — matches formula_extractor.page_columns()
+# Post-processing: reconstruct_fractions  (ported from formula_extractor.py)
+# ---------------------------------------------------------------------------
+
+CELL_VIA_RE = re.compile(
+    r'^(treated\s+cells\s+)?'
+    r'(Cell\s+viability\s*\(%\))\s*=\s*[×\\times\s]+100\s*(untreated\s+cells)?',
+    re.IGNORECASE,
+)
+HEMOLYSIS_RE = re.compile(
+    r'%\s*of\s+hemolysis\s+at\s+\d+\s*nm'
+    r'.*?\(OD\s+of\s+sample.*?OD\s+of.*?control\)\s*=\s*[×\\times\s]+100',
+    re.IGNORECASE | re.DOTALL,
+)
+BIOERADICATION_RE = re.compile(
+    r'(?:formula\s+)?Eradication\s+of\s+biofilm\s*\(%\)'
+    r'\s+OD\s+in\s+control\s+OD\s+in\s+treatment\s*=\s*OD\s+in\s+control',
+    re.IGNORECASE,
+)
+
+
+def reconstruct_fractions(raw_text: str) -> str:
+    """
+    Rewrite a single equation string if it matches a known garbled fraction pattern.
+    Returns the cleaned string (unchanged if no pattern matches).
+    """
+    if CELL_VIA_RE.search(raw_text):
+        return 'Cell viability (%) = (treated cells / untreated cells) × 100'
+    if HEMOLYSIS_RE.search(raw_text):
+        return (
+            '% Hemolysis at 540 nm = '
+            '(OD of sample − OD of −ve control) / '
+            '(OD of +ve control − OD of −ve control) × 100'
+        )
+    if BIOERADICATION_RE.search(raw_text):
+        return (
+            'Eradication of biofilm (%) = '
+            '(OD in control − OD in treatment) / OD in control'
+        )
+    return raw_text
+
+
+# ---------------------------------------------------------------------------
+# Post-processing: dedup  (ported from formula_extractor.py)
+# ---------------------------------------------------------------------------
+
+def _fp(text: str) -> str:
+    """Fingerprint: alnum + operator chars, lowercased, first 65 chars."""
+    return re.sub(r'[^\w=+\-*/×%]', '', text.lower())[:65]
+
+
+def dedup(items: list[dict]) -> list[dict]:
+    """
+    Remove near-duplicates, keeping the LONGEST (most complete) version.
+    Two items are considered duplicates if one's fingerprint is a prefix of the other.
+    """
+    items = sorted(items, key=lambda x: -len(x['raw_text']))
+    seen: set[str] = set()
+    out: list[dict] = []
+
+    for eq in items:
+        fp = _fp(eq['raw_text'])
+        covered = any(
+            fp.startswith(s[:40]) or s.startswith(fp[:40])
+            for s in seen
+        )
+        if not covered:
+            seen.add(fp)
+            out.append(eq)
+
+    return sorted(out, key=lambda x: x['page_number'])
+
+
+# ---------------------------------------------------------------------------
+# Column-aware text extraction
 # ---------------------------------------------------------------------------
 
 def _page_columns(page) -> list[str]:
@@ -120,7 +249,7 @@ def _is_real_equation(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Per-column scanner — matches formula_extractor.scan_column()
+# Per-column scanner
 # ---------------------------------------------------------------------------
 
 def _scan_column(text: str, page_num: int) -> list[dict]:
@@ -198,54 +327,74 @@ def extract_equations(
     if pdfplumber is None:
         return []
 
-    chunks: list[EquationChunk] = []
+    # ── Step 1: collect all raw hits across all pages ─────────────────────────
+    all_hits: list[dict] = []
 
     with pdfplumber.open(source_path) as pdf:
         page_by_num = {p.page_number: p for p in pages}
 
         for plumber_page in pdf.pages:
             page_num = plumber_page.page_number
-            page_meta = page_by_num.get(page_num)
-            page_w = page_meta.width if page_meta else 600.0
-            page_h = page_meta.height if page_meta else 800.0
-
             for col_text in _page_columns(plumber_page):
                 for hit in _scan_column(col_text, page_num):
-                    raw = hit["raw_text"]
+                    all_hits.append(hit)
 
-                    # --- Table-region veto (Bug #2 fix from bugs_and_solutions.md) ---
-                    norm = re.sub(r"\s+", " ", raw).strip().lower()
-                    if norm in row_exclusion:
-                        continue
-                    cell_hits = sum(
-                        1 for c in cell_exclusion if len(c) > 3 and c in norm
-                    )
-                    if cell_hits >= 2:
-                        continue
+    # ── Step 2: apply text cleaning ───────────────────────────────────────────
+    for hit in all_hits:
+        hit["raw_text"] = clean_pdf_text(hit["raw_text"])
 
-                    # --- Section resolution ---
-                    # Use mid-page y as approximation; good enough for section
-                    # assignment because headings are tens of lines apart.
-                    approx_y = page_h * 0.4
-                    pseudo_bbox = (
-                        50.0,
-                        approx_y,
-                        page_w - 50.0,
-                        approx_y + _APPROX_LINE_HEIGHT,
-                    )
-                    section = resolve_section_spatial(page_num, pseudo_bbox, spans)
+    # ── Step 3: reconstruct garbled fractions ─────────────────────────────────
+    for hit in all_hits:
+        hit["raw_text"] = reconstruct_fractions(hit["raw_text"])
 
-                    chunks.append(
-                        EquationChunk(
-                            chunk_id=f"{journal_id}_{article_id}_eq_{len(chunks)+1:05d}",
-                            journal_id=journal_id,
-                            article_id=article_id,
-                            source_path=source_path,
-                            latex=raw,
-                            context=hit.get("context"),
-                            page_number=page_num,
-                            section=section,
-                        )
-                    )
+    # ── Step 4: quality filter (post-cleaning) ────────────────────────────────
+    all_hits = [h for h in all_hits if _is_real_equation_post(h["raw_text"])]
+
+    # ── Step 5: global dedup, keep longest ────────────────────────────────────
+    all_hits = dedup(all_hits)
+
+    # ── Step 6: table-region veto + section resolution + chunk creation ───────
+    chunks: list[EquationChunk] = []
+
+    with pdfplumber.open(source_path) as pdf:
+        page_by_num = {p.page_number: p for p in pages}
+
+        for hit in all_hits:
+            raw = hit["raw_text"]
+            page_num = hit["page_number"]
+
+            # Table-region veto
+            norm = re.sub(r"\s+", " ", raw).strip().lower()
+            if norm in row_exclusion:
+                continue
+            cell_hits = sum(1 for c in cell_exclusion if len(c) > 3 and c in norm)
+            if cell_hits >= 2:
+                continue
+
+            # Section resolution
+            page_meta = page_by_num.get(page_num)
+            page_h = page_meta.height if page_meta else 800.0
+            page_w = page_meta.width if page_meta else 600.0
+            approx_y = page_h * 0.4
+            pseudo_bbox = (
+                50.0,
+                approx_y,
+                page_w - 50.0,
+                approx_y + _APPROX_LINE_HEIGHT,
+            )
+            section = resolve_section_spatial(page_num, pseudo_bbox, spans)
+
+            chunks.append(
+                EquationChunk(
+                    chunk_id=f"{journal_id}_{article_id}_eq_{len(chunks)+1:05d}",
+                    journal_id=journal_id,
+                    article_id=article_id,
+                    source_path=source_path,
+                    latex=raw,
+                    context=hit.get("context"),
+                    page_number=page_num,
+                    section=section,
+                )
+            )
 
     return chunks
