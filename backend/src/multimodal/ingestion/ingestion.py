@@ -30,7 +30,9 @@ class PDFIngestionAgent:
         journal_id, article_id = parse_pdf_filename(source_pdf)
         document_id = build_document_id(source_pdf)
         image_dir = assets_root / document_id / "images"
+        equation_dir = assets_root / document_id / "equations"
         image_dir.mkdir(parents=True, exist_ok=True)
+        equation_dir.mkdir(parents=True, exist_ok=True)
 
         pages = extract_page_blocks(source_pdf)
         spans = build_section_spans_from_blocks(pages)
@@ -49,7 +51,9 @@ class PDFIngestionAgent:
                 source_path=str(source_pdf),
                 token_limit=self.chunk_token_limit,
             ),
-            equation_chunks=extract_equations(
+            equation_images=extract_equations(
+                pdf_path=source_pdf,
+                equation_dir=equation_dir,
                 pages=pages,
                 spans=spans,
                 journal_id=journal_id,

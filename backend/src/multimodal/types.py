@@ -6,6 +6,9 @@ from typing import Any, Literal
 import re
 
 
+AssetSubtype = Literal["figure", "equation"]
+
+
 ContentType = Literal["text", "equation", "table", "image"]
 _PDF_STEM_RE = re.compile(r"^(?P<jid>[A-Za-z]{2,6})_(?P<aid>[A-Za-z0-9]+)$")
 _PDF_STEM_NOUNDERSCORE_RE = re.compile(r"^(?P<jid>[A-Za-z]{2,6})(?P<aid>[0-9]+)$")
@@ -167,6 +170,11 @@ class ExtractedImage:
     image_url: str | None = None
     section: str | None = None
     context: str | None = None  # Phase 6: body text context before figure
+    asset_subtype: AssetSubtype = "figure"
+    bbox_x0: float | None = None
+    bbox_top: float | None = None
+    bbox_x1: float | None = None
+    bbox_bottom: float | None = None
     content_type: ContentType = "image"
 
     @property
@@ -197,6 +205,7 @@ class IngestedDocument:
     source_path: str
     text_chunks: list[TextChunk] = field(default_factory=list)
     equation_chunks: list[EquationChunk] = field(default_factory=list)
+    equation_images: list[ExtractedImage] = field(default_factory=list)
     table_chunks: list[TableChunk] = field(default_factory=list)
     images: list[ExtractedImage] = field(default_factory=list)
 

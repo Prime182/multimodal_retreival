@@ -115,7 +115,7 @@ def create_app() -> FastAPI:
             "article_id": document.article_id,
             "source_path": document.source_path,
             "text_chunks": len(document.text_chunks),
-            "equation_chunks": len(document.equation_chunks),
+            "equation_chunks": len(document.equation_images),
             "table_chunks": len(document.table_chunks),
             "images": len(document.images),
         }

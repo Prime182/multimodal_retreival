@@ -175,16 +175,94 @@ class PublisherArticleStore:
         if count == 0:
             return []
 
-        include = ["metadatas", "distances"]
         effective_limit = min(limit, count)
-        where: dict[str, Any] | None = None
-        if content_types:
-            where = {"kind": {"$in": list(content_types)}}
+        if not content_types:
+            return self._query_results(query_embedding, limit=effective_limit)
+
+        normalized_types = {str(content_type).lower() for content_type in content_types}
+        grouped_results: list[list[SearchResult]] = []
+
+        if "text" in normalized_types:
+            grouped_results.append(
+                self._query_results(
+                    query_embedding,
+                    limit=effective_limit,
+                    where={"kind": "text"},
+                )
+            )
+        if "table" in normalized_types:
+            grouped_results.append(
+                self._query_results(
+                    query_embedding,
+                    limit=effective_limit,
+                    where={"kind": "table"},
+                )
+            )
+        if "image" in normalized_types:
+            grouped_results.append(
+                self._query_results(
+                    query_embedding,
+                    limit=effective_limit,
+                    where={
+                        "$and": [
+                            {"kind": "image"},
+                            {"asset_subtype": "figure"},
+                        ]
+                    },
+                )
+            )
+        if "equation" in normalized_types:
+            grouped_results.append(
+                self._query_results(
+                    query_embedding,
+                    limit=effective_limit,
+                    where={
+                        "$and": [
+                            {"kind": "image"},
+                            {"asset_subtype": "equation"},
+                        ]
+                    },
+                )
+            )
+
+        if not grouped_results:
+            return []
+
+        merged: dict[str, SearchResult] = {}
+        for results in grouped_results:
+            for result in results:
+                existing = merged.get(result.item_id)
+                if existing is None or result.distance < existing.distance:
+                    merged[result.item_id] = result
+
+        return sorted(merged.values(), key=lambda result: (result.distance, result.item_id))[
+            :effective_limit
+        ]
+
+    def search_images(
+        self,
+        query_embedding: list[float],
+        *,
+        limit: int = 5,
+    ) -> list[SearchResult]:
+        return self.search(query_embedding, limit=limit, content_types=["image"])
+
+    def collection_count(self) -> int:
+        return self.collection.count()
+
+    def _query_results(
+        self,
+        query_embedding: list[float],
+        *,
+        limit: int,
+        where: dict[str, Any] | None = None,
+    ) -> list[SearchResult]:
+        include = ["metadatas", "distances"]
 
         try:
             response = self.collection.query(
                 query_embeddings=[query_embedding],
-                n_results=effective_limit,
+                n_results=limit,
                 where=where,
                 include=include,
             )
@@ -212,17 +290,6 @@ class PublisherArticleStore:
                 )
             )
         return results
-
-    def search_images(
-        self,
-        query_embedding: list[float],
-        *,
-        limit: int = 5,
-    ) -> list[SearchResult]:
-        return self.search(query_embedding, limit=limit, content_types=["image"])
-
-    def collection_count(self) -> int:
-        return self.collection.count()
 
 
 def create_store(

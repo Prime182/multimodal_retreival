@@ -28,34 +28,13 @@ class MultimodalRetrievalService:
     def index_pdf(self, pdf_path: str | Path, image_output_dir: str | Path) -> IngestedDocument:
         document = self.ingestion_agent.process_pdf(pdf_path, image_output_dir)
 
-        patched_images: list[ExtractedImage] = []
-        for image in document.images:
-            image_url: str | None = None
-            if self.asset_root is not None:
-                image_path = Path(image.file_path).resolve()
-                try:
-                    relative_path = image_path.relative_to(self.asset_root)
-                except ValueError:
-                    pass
-                else:
-                    image_url = f"{self.asset_url_prefix}/{relative_path.as_posix()}"
-            patched_images.append(replace(image, image_url=image_url))
-
-        if patched_images:
-            document.images = patched_images
+        document.images = self._patch_asset_urls(document.images)
+        document.equation_images = self._patch_asset_urls(document.equation_images)
 
         if document.text_chunks:
             self.store.add_text_chunks(
                 document.text_chunks,
                 self.embedding_client.embed_texts([chunk.embed_text for chunk in document.text_chunks]),
-            )
-
-        if document.equation_chunks:
-            self.store.add_equations(
-                document.equation_chunks,
-                self.embedding_client.embed_texts(
-                    [chunk.embed_text for chunk in document.equation_chunks]
-                ),
             )
 
         if document.table_chunks:
@@ -92,6 +71,21 @@ class MultimodalRetrievalService:
             if images_to_store:
                 self.store.add_images(images_to_store, image_embeddings)
 
+        if document.equation_images:
+            equation_embeddings: list[list[float]] = []
+            equations_to_store: list[ExtractedImage] = []
+            for image in document.equation_images:
+                try:
+                    embedding = self.embedding_client.embed_file(image.file_path)
+                except Exception as exc:
+                    print(f"[WARN] Could not embed equation image {image.file_path}: {exc}")
+                    continue
+                equation_embeddings.append(embedding)
+                equations_to_store.append(image)
+
+            if equations_to_store:
+                self.store.add_images(equations_to_store, equation_embeddings)
+
         return document
 
     def search(
@@ -106,6 +100,21 @@ class MultimodalRetrievalService:
 
     def search_images(self, query: str, limit: int = 5) -> list[SearchResult]:
         return self.search(query, limit=limit, content_types=["image"])
+
+    def _patch_asset_urls(self, images: list[ExtractedImage]) -> list[ExtractedImage]:
+        patched_images: list[ExtractedImage] = []
+        for image in images:
+            image_url: str | None = None
+            if self.asset_root is not None:
+                image_path = Path(image.file_path).resolve()
+                try:
+                    relative_path = image_path.relative_to(self.asset_root)
+                except ValueError:
+                    pass
+                else:
+                    image_url = f"{self.asset_url_prefix}/{relative_path.as_posix()}"
+            patched_images.append(replace(image, image_url=image_url))
+        return patched_images
 
 
 def _blend_embeddings(

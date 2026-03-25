@@ -141,6 +141,7 @@ def extract_images(
                 caption=caption or _build_image_caption(page_number, section),
                 section=section,
                 context=context,  # Phase 6: Pass context
+                asset_subtype="figure",
             )
         )
 

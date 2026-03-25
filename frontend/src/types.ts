@@ -3,6 +3,7 @@ export type ContentType = "text" | "equation" | "table" | "image";
 export type SearchResultMetadata = {
   kind?: ContentType | string | null;
   content_type?: ContentType | string | null;
+  asset_subtype?: "figure" | "equation" | string | null;
   journal_id?: string | null;
   article_id?: string | null;
   section?: string | null;
@@ -24,6 +25,10 @@ export type SearchResultMetadata = {
   page_end?: number | null;
   mimeType?: string | null;
   token_count?: number | null;
+  bbox_x0?: number | null;
+  bbox_top?: number | null;
+  bbox_x1?: number | null;
+  bbox_bottom?: number | null;
 };
 
 export type SearchResult = {

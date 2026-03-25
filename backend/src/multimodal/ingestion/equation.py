@@ -1,321 +1,189 @@
-# backend/src/multimodal/ingestion/equation.py
 from __future__ import annotations
 
-import re
+from collections import defaultdict
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 try:
     import pdfplumber
-except ImportError:
+except ImportError:  # pragma: no cover - optional dependency in some environments
     pdfplumber = None  # type: ignore[assignment]
 
-from ..types import EquationChunk, PageBlocks, SectionSpan
-from .section import _APPROX_LINE_HEIGHT, resolve_section_spatial
+try:
+    from pdf2image import convert_from_path
+except ImportError:  # pragma: no cover - optional dependency in some environments
+    convert_from_path = None  # type: ignore[assignment]
 
-# ---------------------------------------------------------------------------
-# Patterns — ported directly from formula_extractor.py
-# ---------------------------------------------------------------------------
+from ..types import ExtractedImage, PageBlocks, SectionSpan
+from .section import resolve_section_spatial
+from .utils import require_command
 
-FORMULA_INTRO = re.compile(
-    r"(?:using\s+the\s+following\s+formula"
-    r"|calculated\s+using\s+the\s+following"
-    r"|determine\s+by\s+using\s+the\s+following"
-    r"|determined\s+by\s+the\s+following)",
-    re.IGNORECASE,
-)
+DPI = 300
+PADDING = 10
+OVERLAP_TOL = 1.0
+BLOCK_GAP = 10.0
+MIN_BLOCK_WIDTH = 40.0
+MIN_BLOCK_HEIGHT = 18.0
+CENTRE_MIN = 0.20
+CENTRE_MAX = 0.80
+LINE_TOL = 4.0
 
-MATH_SYM = re.compile(r"[×÷±√∑∫≤≥≠≈∞μαβγδλσφπΩ°]")
-
-NAMED_KW = re.compile(
-    r"(?:cell\s*viability|eradication\s*of\s*biofilm"
-    r"|%\s*of\s*hemolysis|eradication\s*\(%\)"
-    r"|hemolysis\s*at\s*\d+\s*nm)",
-    re.IGNORECASE,
-)
-
-NOISE_RE = re.compile(
-    r"^(?:figure\s*\d|table\s*\d|scheme\s*\d"
-    r"|https?://|doi\s*[:\.]|\d{3,5}\s*$)",
-    re.IGNORECASE,
-)
-
-SECTION_RE = re.compile(
-    r"^(?:\d+[\.\d]*\.?\s+)[A-Z][^\n]{3,80}$",
-    re.MULTILINE,
-)
-
-# ---------------------------------------------------------------------------
-# Post-processing: clean_pdf_text  (ported from formula_extractor.py)
-# ---------------------------------------------------------------------------
-
-KNOWN_PAIRS = [
-    ('treatedcells',          'treated cells'),
-    ('untreatedcells',        'untreated cells'),
-    ('cellviability',         'Cell viability'),
-    ('eradicationofbiofilm',  'Eradication of biofilm'),
-    ('odinsample',            'OD in sample'),
-    ('odincontrol',           'OD in control'),
-    ('odintreatment',         'OD in treatment'),
-    ('odofsample',            'OD of sample'),
-    ('odof',                  'OD of '),
-    ('vecontrol',             've control'),
-    ('ofhemolysisat',         'of hemolysis at '),
-    ('%ofhemolysis',          '% of hemolysis'),
-    ('standarddeviation',     'standard deviation'),
-    ('shownhereasthe',        'shown here as the'),
-    ('valuesare',             'values are'),
-    ('areshownhere',          'are shown here'),
-]
-
-CAMEL_RE = re.compile(r'(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])')
-
-STATS_ONLY = re.compile(
-    r'^(?:(?:values?\s*)?(?:are\s+)?shown\s+here\s+as\s+the\s+means?'
-    r'|means?\s*[±\+]\s*standard\s+deviation'
-    r'|\(n\s*=\s*\d+\))',
-    re.IGNORECASE,
-)
+EQUATION_FONTS = {
+    "ATRMRS+ArnoPro-Regular",
+    "ZDNDLO+ArnoPro-Regular",
+    "IIVZSS+ArnoPro-Italic",
+    "SPJFMW+ArnoPro-Regular",
+    "WOCWKH+STIXGeneral-Regular",
+    "FHKMDR+STIXGeneral-Regular",
+    "KFDOGS+STIXGeneral-Regular",
+}
+MATH_OPERATOR_FONTS = {
+    "JMRPAX+STIXGeneral-Regular",
+    "KFDOGS+STIXGeneral-Regular",
+    "FHKMDR+STIXGeneral-Regular",
+    "WOCWKH+STIXGeneral-Regular",
+}
 
 
-def clean_pdf_text(text: str) -> str:
-    """Fix common PDF text extraction artefacts in equation strings."""
-    s = text
-    for run, spaced in KNOWN_PAIRS:
-        s = re.sub(re.escape(run), spaced, s, flags=re.IGNORECASE)
-    s = CAMEL_RE.sub(' ', s)
-    s = re.sub(r'  +', ' ', s).strip()
-    return s
-
-
-def _is_real_equation_post(text: str) -> bool:
-    """Post-processing quality check: reject stat annotations and trivial strings."""
-    if STATS_ONLY.match(text.strip()):
-        return False
-    if text.strip() in ('= × 100', '= ×100', '='):
-        return False
-    if '=' not in text:
-        return False
-    lhs, _, rhs = text.partition('=')
-    lhs_ok = len(re.sub(r'\s', '', lhs)) > 3
-    rhs_ok = len(re.sub(r'\s', '', rhs)) > 1
-    return lhs_ok and rhs_ok
-
-
-# ---------------------------------------------------------------------------
-# Post-processing: reconstruct_fractions  (ported from formula_extractor.py)
-# ---------------------------------------------------------------------------
-
-CELL_VIA_RE = re.compile(
-    r'^(treated\s+cells\s+)?'
-    r'(Cell\s+viability\s*\(%\))\s*=\s*[×\\times\s]+100\s*(untreated\s+cells)?',
-    re.IGNORECASE,
-)
-HEMOLYSIS_RE = re.compile(
-    r'%\s*of\s+hemolysis\s+at\s+\d+\s*nm'
-    r'.*?\(OD\s+of\s+sample.*?OD\s+of.*?control\)\s*=\s*[×\\times\s]+100',
-    re.IGNORECASE | re.DOTALL,
-)
-BIOERADICATION_RE = re.compile(
-    r'(?:formula\s+)?Eradication\s+of\s+biofilm\s*\(%\)'
-    r'\s+OD\s+in\s+control\s+OD\s+in\s+treatment\s*=\s*OD\s+in\s+control',
-    re.IGNORECASE,
-)
-
-
-def reconstruct_fractions(raw_text: str) -> str:
-    """
-    Rewrite a single equation string if it matches a known garbled fraction pattern.
-    Returns the cleaned string (unchanged if no pattern matches).
-    """
-    if CELL_VIA_RE.search(raw_text):
-        return 'Cell viability (%) = (treated cells / untreated cells) × 100'
-    if HEMOLYSIS_RE.search(raw_text):
-        return (
-            '% Hemolysis at 540 nm = '
-            '(OD of sample − OD of −ve control) / '
-            '(OD of +ve control − OD of −ve control) × 100'
-        )
-    if BIOERADICATION_RE.search(raw_text):
-        return (
-            'Eradication of biofilm (%) = '
-            '(OD in control − OD in treatment) / OD in control'
-        )
-    return raw_text
-
-
-# ---------------------------------------------------------------------------
-# Post-processing: dedup  (ported from formula_extractor.py)
-# ---------------------------------------------------------------------------
-
-def _fp(text: str) -> str:
-    """Fingerprint: alnum + operator chars, lowercased, first 65 chars."""
-    return re.sub(r'[^\w=+\-*/×%]', '', text.lower())[:65]
-
-
-def dedup(items: list[dict]) -> list[dict]:
-    """
-    Remove near-duplicates, keeping the LONGEST (most complete) version.
-    Two items are considered duplicates if one's fingerprint is a prefix of the other.
-    """
-    items = sorted(items, key=lambda x: -len(x['raw_text']))
-    seen: set[str] = set()
-    out: list[dict] = []
-
-    for eq in items:
-        fp = _fp(eq['raw_text'])
-        covered = any(
-            fp.startswith(s[:40]) or s.startswith(fp[:40])
-            for s in seen
-        )
-        if not covered:
-            seen.add(fp)
-            out.append(eq)
-
-    return sorted(out, key=lambda x: x['page_number'])
-
-
-# ---------------------------------------------------------------------------
-# Column-aware text extraction
-# ---------------------------------------------------------------------------
-
-def _page_columns(page) -> list[str]:
-    """Return [left_col, right_col] for two-column pages, else [full_text]."""
-    pw = page.width
-
-    def crop(x0: float, x1: float) -> str:
-        try:
-            return (
-                page.crop((x0, 0, x1, page.height)).extract_text(
-                    x_tolerance=3, y_tolerance=3
-                )
-                or ""
-            )
-        except Exception:
-            return ""
-
-    left = crop(0, pw / 2)
-    right = crop(pw / 2, pw)
-    if len(left) > 150 and len(right) > 150:
-        return [left, right]
-    return [page.extract_text(x_tolerance=3, y_tolerance=3) or ""]
-
-
-# ---------------------------------------------------------------------------
-# Formula collection helpers
-# ---------------------------------------------------------------------------
-
-def _collect_display_formula(lines: list[str], intro_idx: int) -> str:
-    """Collect lines immediately after a formula-introduction phrase."""
-    parts: list[str] = []
-    blank_count = 0
-    for i in range(intro_idx + 1, min(len(lines), intro_idx + 12)):
-        s = lines[i].strip()
-        if not s:
-            blank_count += 1
-            if blank_count > 1:
-                break
-            continue
-        if SECTION_RE.match(s) or NOISE_RE.match(s):
-            break
-        if parts and s.endswith(".") and len(s) > 60:
-            break
-        parts.append(s)
-        blank_count = 0
-    return " ".join(parts)
-
-
-def _extract_context(lines: list[str], line_idx: int) -> str:
-    """Return one sentence of surrounding context for an equation line."""
-    before = " ".join(
-        l.strip() for l in lines[max(0, line_idx - 2) : line_idx] if l.strip()
-    )[-250:]
-    if not before:
-        return "Equation extracted from document."
-    for sentence in re.split(r"(?<=[.!?])\s+", before):
-        if sentence.strip():
-            return sentence.strip()
-    return before
-
-
-def _is_real_equation(text: str) -> bool:
-    """Require a meaningful LHS and RHS around the equals sign."""
-    if "=" not in text:
-        return False
-    lhs, _, rhs = text.partition("=")
-    lhs_ok = len(re.sub(r"\s", "", lhs)) > 3
-    rhs_ok = len(re.sub(r"\s", "", rhs)) > 1
-    return lhs_ok and rhs_ok
-
-
-# ---------------------------------------------------------------------------
-# Per-column scanner
-# ---------------------------------------------------------------------------
-
-def _scan_column(text: str, page_num: int) -> list[dict]:
-    if not text.strip():
+def cluster_by_overlap(words: list[dict[str, Any]], tol: float = OVERLAP_TOL) -> list[list[Any]]:
+    """Merge words whose vertical extents overlap into clusters."""
+    if not words:
         return []
 
-    lines = text.split("\n")
-    results: list[dict] = []
-    seen: set[str] = set()
-
-    def register(formula: str, line_idx: int) -> None:
-        norm = re.sub(r"\s+", " ", formula).strip()
-        if len(norm) < 6 or NOISE_RE.match(norm):
-            return
-        if not _is_real_equation(norm):
-            return
-        key = re.sub(r"[^\w=+\-*/×%]", "", norm.lower())[:65]
-        if key in seen:
-            return
-        seen.add(key)
-        results.append(
-            {
-                "raw_text": norm,
-                "page_number": page_num,
-                "context": _extract_context(lines, line_idx),
-            }
-        )
-
-    # Pass A — formula-introduction phrases
-    for i, line in enumerate(lines):
-        if FORMULA_INTRO.search(line):
-            formula = _collect_display_formula(lines, i)
-            if formula and ("=" in formula or "%" in formula):
-                register(formula, i)
-
-    # Pass B — named biological/chemical calculation formulas
-    for i, line in enumerate(lines):
-        s = line.strip()
-        if NAMED_KW.search(s) and ("=" in s or "%" in s):
-            chunk = s
-            for j in range(1, 6):
-                nxt = lines[i + j].strip() if i + j < len(lines) else ""
-                if not nxt or NOISE_RE.match(nxt) or SECTION_RE.match(nxt):
-                    break
-                chunk += " " + nxt
-                if chunk.count("=") >= 1 and ("100" in chunk or ")" in chunk):
-                    break
-            register(chunk, i)
-
-    # Pass C — inline math signals (math symbol + equals sign)
-    for i, line in enumerate(lines):
-        s = line.strip()
-        if not s or NOISE_RE.match(s):
-            continue
-        if (MATH_SYM.search(s) and "=" in s) or ("OD" in s and "=" in s):
-            register(s, i)
-
-    return results
+    words_sorted = sorted(words, key=lambda word: word["top"])
+    clusters: list[list[Any]] = []
+    for word in words_sorted:
+        placed = False
+        for cluster in clusters:
+            if word["top"] < cluster[1] + tol:
+                cluster[2].append(word)
+                cluster[1] = max(cluster[1], word["bottom"])
+                placed = True
+                break
+        if not placed:
+            clusters.append([word["top"], word["bottom"], [word]])
+    return clusters
 
 
-# ---------------------------------------------------------------------------
-# Public entry point — called by ingestion.py (signature unchanged)
-# ---------------------------------------------------------------------------
+def clusters_to_blocks(clusters: list[list[Any]], gap: float = BLOCK_GAP) -> list[list[list[Any]]]:
+    """Merge consecutive clusters separated by <= gap into equation blocks."""
+    if not clusters:
+        return []
+
+    blocks: list[list[list[Any]]] = []
+    current = [clusters[0]]
+    prev_bottom = clusters[0][1]
+    for cluster in clusters[1:]:
+        if cluster[0] - prev_bottom <= gap:
+            current.append(cluster)
+        else:
+            blocks.append(current)
+            current = [cluster]
+        prev_bottom = max(prev_bottom, cluster[1])
+    blocks.append(current)
+    return blocks
+
+
+def should_keep_equation_box(
+    x0: float,
+    top: float,
+    x1: float,
+    bottom: float,
+    page_width: float,
+) -> bool:
+    block_width = x1 - x0
+    block_height = bottom - top
+    if block_width < MIN_BLOCK_WIDTH or block_height < MIN_BLOCK_HEIGHT:
+        return False
+
+    midpoint_fraction = ((x0 + x1) / 2.0) / page_width if page_width else 0.0
+    return CENTRE_MIN <= midpoint_fraction <= CENTRE_MAX
+
+
+def _line_bucket(word: dict[str, Any]) -> float:
+    return round(word["top"] / LINE_TOL) * LINE_TOL
+
+
+def _build_equation_boxes(pdf_path: str | Path) -> list[dict[str, float | int]]:
+    boxes: list[dict[str, float | int]] = []
+
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        for page_number, page in enumerate(pdf.pages, start=1):
+            words = page.extract_words(extra_attrs=["fontname", "size"]) or []
+            equation_words = [
+                word for word in words if word.get("fontname", "") in EQUATION_FONTS
+            ]
+            if not equation_words:
+                continue
+
+            equation_lines = {_line_bucket(word) for word in equation_words}
+            operator_words = [
+                word
+                for word in words
+                if word.get("fontname", "") in MATH_OPERATOR_FONTS
+                and _line_bucket(word) in equation_lines
+            ]
+            all_equation_words = equation_words + operator_words
+
+            clusters = cluster_by_overlap(all_equation_words)
+            blocks = clusters_to_blocks(clusters)
+
+            for block in blocks:
+                block_words = [word for cluster in block for word in cluster[2]]
+                equation_only_words = [
+                    word
+                    for word in block_words
+                    if word.get("fontname", "") in EQUATION_FONTS
+                ]
+                if not equation_only_words:
+                    equation_only_words = block_words
+
+                x0 = min(word["x0"] for word in equation_only_words)
+                x1 = max(word["x1"] for word in equation_only_words)
+                top = min(word["top"] for word in block_words)
+                bottom = max(word["bottom"] for word in block_words)
+
+                if not should_keep_equation_box(x0, top, x1, bottom, page.width):
+                    continue
+
+                boxes.append(
+                    {
+                        "page": page_number,
+                        "x0": x0,
+                        "top": top,
+                        "x1": x1,
+                        "bottom": bottom,
+                        "page_width": page.width,
+                        "page_height": page.height,
+                    }
+                )
+
+    return sorted(boxes, key=lambda item: (item["page"], item["top"], item["x0"]))
+
+
+def _crop_box_to_pixels(
+    box: dict[str, float | int],
+    *,
+    image_width: int,
+    image_height: int,
+    padding: int = PADDING,
+) -> tuple[int, int, int, int]:
+    pdf_width = float(box["page_width"])
+    pdf_height = float(box["page_height"])
+    scale_x = image_width / pdf_width if pdf_width else 1.0
+    scale_y = image_height / pdf_height if pdf_height else 1.0
+
+    px_x0 = max(0, int(float(box["x0"]) * scale_x) - padding)
+    px_top = max(0, int(float(box["top"]) * scale_y) - padding)
+    px_x1 = min(image_width, int(float(box["x1"]) * scale_x) + padding)
+    px_bottom = min(image_height, int(float(box["bottom"]) * scale_y) + padding)
+    return px_x0, px_top, px_x1, px_bottom
+
 
 def extract_equations(
     *,
+    pdf_path: Path,
+    equation_dir: Path,
     pages: Sequence[PageBlocks],
     spans: Sequence[SectionSpan],
     journal_id: str,
@@ -323,78 +191,90 @@ def extract_equations(
     source_path: str,
     cell_exclusion: set[str],
     row_exclusion: set[str],
-) -> list[EquationChunk]:
+) -> list[ExtractedImage]:
+    del cell_exclusion
+    del row_exclusion
+
     if pdfplumber is None:
+        raise RuntimeError("pdfplumber is required for equation extraction.")
+    if convert_from_path is None:
+        raise RuntimeError("pdf2image is required for equation crop extraction.")
+
+    require_command("pdftoppm")
+    require_command("pdfinfo")
+
+    equation_dir.mkdir(parents=True, exist_ok=True)
+    boxes = _build_equation_boxes(pdf_path)
+    if not boxes:
         return []
 
-    # ── Step 1: collect all raw hits across all pages ─────────────────────────
-    all_hits: list[dict] = []
+    boxes_by_page: dict[int, list[dict[str, float | int]]] = defaultdict(list)
+    for box in boxes:
+        boxes_by_page[int(box["page"])].append(box)
 
-    with pdfplumber.open(source_path) as pdf:
-        page_by_num = {p.page_number: p for p in pages}
+    equation_images: list[ExtractedImage] = []
+    for page_number in sorted(boxes_by_page):
+        rendered_pages = convert_from_path(
+            str(pdf_path),
+            dpi=DPI,
+            first_page=page_number,
+            last_page=page_number,
+        )
+        if not rendered_pages:
+            continue
 
-        for plumber_page in pdf.pages:
-            page_num = plumber_page.page_number
-            for col_text in _page_columns(plumber_page):
-                for hit in _scan_column(col_text, page_num):
-                    all_hits.append(hit)
+        page_image = rendered_pages[0]
+        image_width, image_height = page_image.size
 
-    # ── Step 2: apply text cleaning ───────────────────────────────────────────
-    for hit in all_hits:
-        hit["raw_text"] = clean_pdf_text(hit["raw_text"])
-
-    # ── Step 3: reconstruct garbled fractions ─────────────────────────────────
-    for hit in all_hits:
-        hit["raw_text"] = reconstruct_fractions(hit["raw_text"])
-
-    # ── Step 4: quality filter (post-cleaning) ────────────────────────────────
-    all_hits = [h for h in all_hits if _is_real_equation_post(h["raw_text"])]
-
-    # ── Step 5: global dedup, keep longest ────────────────────────────────────
-    all_hits = dedup(all_hits)
-
-    # ── Step 6: table-region veto + section resolution + chunk creation ───────
-    chunks: list[EquationChunk] = []
-
-    with pdfplumber.open(source_path) as pdf:
-        page_by_num = {p.page_number: p for p in pages}
-
-        for hit in all_hits:
-            raw = hit["raw_text"]
-            page_num = hit["page_number"]
-
-            # Table-region veto
-            norm = re.sub(r"\s+", " ", raw).strip().lower()
-            if norm in row_exclusion:
-                continue
-            cell_hits = sum(1 for c in cell_exclusion if len(c) > 3 and c in norm)
-            if cell_hits >= 2:
-                continue
-
-            # Section resolution
-            page_meta = page_by_num.get(page_num)
-            page_h = page_meta.height if page_meta else 800.0
-            page_w = page_meta.width if page_meta else 600.0
-            approx_y = page_h * 0.4
-            pseudo_bbox = (
-                50.0,
-                approx_y,
-                page_w - 50.0,
-                approx_y + _APPROX_LINE_HEIGHT,
+        for equation_index, box in enumerate(boxes_by_page[page_number], start=1):
+            crop_bounds = _crop_box_to_pixels(
+                box,
+                image_width=image_width,
+                image_height=image_height,
             )
-            section = resolve_section_spatial(page_num, pseudo_bbox, spans)
+            crop = page_image.crop(crop_bounds)
 
-            chunks.append(
-                EquationChunk(
-                    chunk_id=f"{journal_id}_{article_id}_eq_{len(chunks)+1:05d}",
+            file_name = f"equation_p{page_number}_{equation_index}.png"
+            file_path = equation_dir / file_name
+            crop.save(file_path)
+
+            section = resolve_section_spatial(
+                page_number,
+                (
+                    float(box["x0"]),
+                    float(box["top"]),
+                    float(box["x1"]),
+                    float(box["bottom"]),
+                ),
+                spans,
+            )
+
+            caption = (
+                f"Equation on page {page_number}"
+                if section is None
+                else f"Equation in {section} on page {page_number}"
+            )
+
+            equation_images.append(
+                ExtractedImage(
+                    image_id=f"{journal_id}_{article_id}_eq_{len(equation_images) + 1:05d}",
                     journal_id=journal_id,
                     article_id=article_id,
                     source_path=source_path,
-                    latex=raw,
-                    context=hit.get("context"),
-                    page_number=page_num,
+                    file_path=str(file_path),
+                    page_number=page_number,
+                    mime_type="image/png",
+                    width=crop.width,
+                    height=crop.height,
+                    caption=caption,
                     section=section,
+                    content_type="image",
+                    asset_subtype="equation",
+                    bbox_x0=float(box["x0"]),
+                    bbox_top=float(box["top"]),
+                    bbox_x1=float(box["x1"]),
+                    bbox_bottom=float(box["bottom"]),
                 )
             )
 
-    return chunks
+    return equation_images

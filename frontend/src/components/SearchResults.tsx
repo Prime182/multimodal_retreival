@@ -30,7 +30,15 @@ function isContentType(value: unknown): value is ContentType {
   return value === "text" || value === "equation" || value === "table" || value === "image";
 }
 
+function isEquationAsset(metadata: SearchResult["metadata"]) {
+  return metadata.asset_subtype === "equation";
+}
+
 function resolveKind(metadata: SearchResult["metadata"]): ContentType {
+  if (isEquationAsset(metadata)) {
+    return "equation";
+  }
+
   if (isContentType(metadata.kind)) {
     return metadata.kind;
   }
@@ -238,16 +246,19 @@ function renderTextCard(metadata: SearchResult["metadata"]) {
 }
 
 function renderEquationCard(metadata: SearchResult["metadata"]) {
-  const latex = metadata.latex ?? metadata.document ?? metadata.caption ?? "";
-  const context = metadata.context ?? metadata.text ?? "";
+  const src = getImageSource(metadata);
+  const caption = metadata.caption ?? metadata.title ?? "Equation crop";
 
   return (
     <div className="search-results__media search-results__media--equation">
-      <pre className="sr-eq-block">{latex.trim() || "No equation text available."}</pre>
-      <p className="search-results__preview search-results__preview--context">
-        {context.trim() || "No surrounding context available."}
-      </p>
-      <span className="search-results__media-label">Equation excerpt</span>
+      {src ? (
+        <img className="search-results__image" src={src} alt={caption} loading="lazy" />
+      ) : (
+        <div className="search-results__placeholder">
+          <span>Equation image unavailable</span>
+        </div>
+      )}
+      <span className="search-results__media-label">Equation crop</span>
     </div>
   );
 }
